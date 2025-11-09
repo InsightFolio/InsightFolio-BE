@@ -1,15 +1,9 @@
 from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
-from flask_bcrypt import Bcrypt
-from flask_jwt_extended import JWTManager
+from .extensions import db, bcrypt, jwt
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from pathlib import Path
-
-db = SQLAlchemy()
-bcrypt = Bcrypt()
-jwt = JWTManager()
 
 def create_app():
     load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
