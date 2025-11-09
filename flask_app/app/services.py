@@ -1,5 +1,5 @@
 from sqlalchemy import select
-from extensions import db
+from .extensions import db
 from models import User, Stock, Score, Log, Transaction
 
 # USERS
