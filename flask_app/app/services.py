@@ -1,6 +1,6 @@
 from sqlalchemy import select
 from .extensions import db
-from models import User, Stock, Score, Log, Transaction
+from .models import User, Stock, Score, Log, Transaction
 
 # USERS
 def upsert_user(username: str, email: str, password_plain: str, balance=0.0, risk_averse='no') -> User:
