@@ -1,6 +1,6 @@
 from app import create_app
 from extensions import db
-from services import upsert_user, upsert_stock, add_score_for_symbol, add_log_for_email, add_transaction
+from app.services import upsert_user, upsert_stock, add_score_for_symbol, add_log_for_email, add_transaction
 
 app = create_app()
 with app.app_context():

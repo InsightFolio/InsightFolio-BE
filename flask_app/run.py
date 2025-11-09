@@ -1,8 +1,8 @@
 from app import create_app, db
 import os
 from flask import request, jsonify
-from services import upsert_user, upsert_stock, add_transaction
-from extensions import db
+from app.services import upsert_user, upsert_stock, add_transaction
+from app.extensions import db
 app = create_app()
 
 with app.app_context():
