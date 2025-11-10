@@ -1,8 +1,8 @@
 from flask import Blueprint, request, jsonify
 from . import db, jwt
-from .models import User
+from .models import User, Stock
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .services import upsert_user, upsert_stock, add_transaction
+from .services import upsert_user, upsert_stock, add_transaction, search_stocks
 from .seed import seed_database
 
 routes_bp = Blueprint('routes', __name__)
@@ -72,3 +72,49 @@ def create_transaction():
 def seed_database_endpoint():
     result = seed_database()
     return result, 201
+
+@routes_bp.route('/api/stocks/search', methods=['GET'])
+def search_stocks_endpoint():
+    """
+    Search stocks based on text and optional filters.
+    Query parameters:
+    - text: Search text (searches in Symbol and Company)
+    - country: Filter by country (optional)
+    - min_price: Minimum price filter (optional, default 0)
+    - max_price: Maximum price filter (optional, default 0)
+    - sector: Filter by sector (optional)
+    - sub_sector: Filter by sub-sector (optional)
+    """
+    text = request.args.get('text', '')
+    country = request.args.get('country', '')
+    min_price = float(request.args.get('min_price', 0))
+    max_price = float(request.args.get('max_price', 0))
+    sector = request.args.get('sector', '')
+    sub_sector = request.args.get('sub_sector', '')
+    
+    results = search_stocks(
+        text=text,
+        country=country,
+        min_price=min_price,
+        max_price=max_price,
+        sector=sector,
+        sub_sector=sub_sector
+    )
+    
+    # Convert results to JSON-serializable format
+    stocks_data = [
+        {
+            'stock_id': stock.stock_id,
+            'symbol': stock.symbol,
+            'company': stock.company,
+            'sector': stock.sector,
+            'sub_sector': stock.sub_sector,
+            'country': stock.country,
+            'price': float(stock.price),
+            'quantity': stock.quantity,
+            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
+        }
+        for stock in results
+    ]
+    
+    return jsonify(stocks_data), 200
