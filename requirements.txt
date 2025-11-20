@@ -12,11 +12,17 @@ Flask-SQLAlchemy==3.1.1
 greenlet==3.2.4
 itsdangerous==2.2.0
 Jinja2==3.1.6
+lightgbm==4.3.0
 MarkupSafe==3.0.3
+numpy==1.26.4
+pandas==2.2.3
+pytest==8.3.4
 pycparser==2.23
 PyJWT==2.10.1
 PyMySQL==1.1.2
 python-dotenv==1.2.1
+qlib==0.9.2
+scikit-learn==1.6.0
 setuptools==80.9.0
 SQLAlchemy==2.0.44
 typing_extensions==4.15.0

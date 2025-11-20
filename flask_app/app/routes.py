@@ -1,7 +1,9 @@
 from flask import Blueprint, request, jsonify
+from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
+
 from . import db, jwt
 from .models import User
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from .scoring import QlibConfig, load_config_from_env, run_scoring_workflow
 
 routes_bp = Blueprint('routes', __name__)
 
@@ -21,6 +23,20 @@ def login():
     data = request.get_json()
     user = User.query.filter_by(username=data['username']).first() or User.query.filter_by(email=data['username']).first()
     if user and user.check_password(data['password']):
-        token = create_access_token(identity=str(user.id))  
+        token = create_access_token(identity=str(user.id))
         return jsonify({'token': token}), 200
     return jsonify({'error': 'Invalid credentials'}), 401
+
+
+@routes_bp.route('/score', methods=['POST'])
+def score():
+    payload = request.get_json(silent=True) or {}
+    overrides = payload.get('config') if isinstance(payload, dict) else {}
+    config: QlibConfig = load_config_from_env(overrides)
+
+    try:
+        response = run_scoring_workflow(config)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        return jsonify({'error': str(exc)}), 500
+
+    return jsonify(response), 200
