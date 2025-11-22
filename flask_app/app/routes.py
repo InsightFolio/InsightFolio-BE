@@ -1,4 +1,5 @@
 from flask import Blueprint, request, jsonify
+from sqlalchemy import select, case
 from . import db, jwt
 from .models import User, Stock
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
@@ -73,6 +74,71 @@ def seed_database_endpoint():
     result = seed_database()
     return result, 201
 
+@routes_bp.route('/popular', methods=['GET'])
+def popular_stocks():
+    """
+    Return the curated popular stocks (optionally limited via ?limit=6).
+    Uses DB values when present; falls back to the curated defaults when missing.
+    """
+    popular_list = [
+        ("NVDA", "NVIDIA Corporation"),
+        ("ONDS", "Ondas Holdings Inc."),
+        ("TSLA", "Tesla, Inc."),
+        ("OPEN", "Opendoor Technologies, Inc."),
+        ("PLUG", "Plug Power Inc."),
+        ("SOFI", "SoFi Technologies, Inc."),
+    ]
+
+    try:
+        limit = int(request.args.get("limit", 6))
+    except ValueError:
+        limit = 6
+    limit = max(0, limit)
+    if limit == 0:
+        return jsonify([]), 200
+
+    selected = popular_list[:limit]
+    symbols = [s[0] for s in selected]
+
+    # Pull curated symbols (any price), preserving curated order.
+    ordering = case({sym: idx for idx, sym in enumerate(symbols)}, value=Stock.symbol, else_=len(symbols))
+    db_results = db.session.execute(
+        select(Stock).where(Stock.symbol.in_(symbols)).order_by(ordering)
+    ).scalars().all()
+    existing_map = {stock.symbol: stock for stock in db_results}
+
+    response = []
+    for symbol, company in selected:
+        stock = existing_map.get(symbol)
+        if stock:
+            response.append({
+                'stock_id': stock.stock_id,
+                'symbol': stock.symbol,
+                'company': stock.company,
+                'sector': stock.sector,
+                'sub_sector': stock.sub_sector,
+                'country': stock.country,
+                'price': float(stock.price or 0),
+                'quantity': stock.quantity,
+                'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
+            })
+        else:
+            # Fallback to curated default when DB row is missing
+            response.append({
+                'stock_id': None,
+                'symbol': symbol,
+                'company': company,
+                'sector': None,
+                'sub_sector': None,
+                'country': None,
+                'price': 0.0,
+                'quantity': 0,
+                'last_updated': None
+            })
+
+    return jsonify(response), 200
+
+@routes_bp.route('/api/stocks/search', methods=['GET'])
 @routes_bp.route('/search', methods=['POST'])
 def search_stocks_endpoint():
     """
@@ -126,3 +192,19 @@ def search_stocks_endpoint():
     ]
     
     return jsonify(stocks_data), 200
+
+def _stocks_to_json(stocks):
+    return [
+        {
+            'stock_id': stock.stock_id,
+            'symbol': stock.symbol,
+            'company': stock.company,
+            'sector': stock.sector,
+            'sub_sector': stock.sub_sector,
+            'country': stock.country,
+            'price': float(stock.price),
+            'quantity': stock.quantity,
+            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
+        }
+        for stock in stocks
+    ]
