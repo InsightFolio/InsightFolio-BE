@@ -73,24 +73,32 @@ def seed_database_endpoint():
     result = seed_database()
     return result, 201
 
-@routes_bp.route('/api/stocks/search', methods=['GET'])
+@routes_bp.route('/search', methods=['POST'])
 def search_stocks_endpoint():
     """
     Search stocks based on text and optional filters.
-    Query parameters:
-    - text: Search text (searches in Symbol and Company)
-    - country: Filter by country (optional)
-    - min_price: Minimum price filter (optional, default 0)
-    - max_price: Maximum price filter (optional, default 0)
-    - sector: Filter by sector (optional)
-    - sub_sector: Filter by sub-sector (optional)
+    Request body:
+    {
+        "text": "",
+        "filters": {
+            "country": "",
+            "min_price": 0,
+            "max_price": 100,
+            "sector": "",
+            "sub_sector": ""
+        }
+    }
     """
-    text = request.args.get('text', '')
-    country = request.args.get('country', '')
-    min_price = float(request.args.get('min_price', 0))
-    max_price = float(request.args.get('max_price', 0))
-    sector = request.args.get('sector', '')
-    sub_sector = request.args.get('sub_sector', '')
+    data = request.get_json()
+    
+    text = data.get('text', '')
+    filters = data.get('filters', {})
+    
+    country = filters.get('country', '')
+    min_price = float(filters.get('min_price', 0))
+    max_price = float(filters.get('max_price', 0))
+    sector = filters.get('sector', '')
+    sub_sector = filters.get('sub_sector', '')
     
     results = search_stocks(
         text=text,
