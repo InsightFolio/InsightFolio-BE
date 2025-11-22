@@ -1,4 +1,4 @@
-from app import create_app, db
+from flask_app.app import create_app, db
 import os
 
 app = create_app()
