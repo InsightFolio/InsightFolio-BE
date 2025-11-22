@@ -43,9 +43,6 @@ def score():
         return jsonify({'error': str(exc)}), 500
 
     return jsonify(response), 200
-        token = create_access_token(identity=str(user.user_id))  
-        return jsonify({'token': token}), 200
-    return jsonify({'error': 'Invalid credentials'}), 401
 
 @routes_bp.route('/users', methods=['POST'])
 def create_or_update_user():
