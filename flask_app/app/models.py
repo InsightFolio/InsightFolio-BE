@@ -1,5 +1,5 @@
 from .extensions import db, bcrypt
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Enum
 
 # =========================
@@ -14,7 +14,7 @@ class User(db.Model):
     password = db.Column('Password', db.String(255), nullable=False)
     balance = db.Column('Balance', db.Numeric(15, 2), default=0.00)
     risk_averse = db.Column('RiskAverse', Enum('yes', 'no', name='risk_averse_enum'), nullable=False, default='no')
-    registered_at = db.Column('RegisteredAt', db.DateTime, default=datetime.utcnow)
+    registered_at = db.Column('RegisteredAt', db.DateTime, default=lambda: datetime.now(timezone.utc))
     
     # Relationships
     logs = db.relationship('Log', backref='user', lazy=True, cascade='all, delete-orphan')
@@ -46,7 +46,7 @@ class Stock(db.Model):
     country = db.Column('Country', db.String(100))
     price = db.Column('Price', db.Numeric(15, 2), nullable=False)
     quantity = db.Column('Quantity', db.BigInteger, default=0)
-    last_updated = db.Column('LastUpdated', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_updated = db.Column('LastUpdated', db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     # Relationships
     scores = db.relationship('Score', backref='stock', lazy=True, cascade='all, delete-orphan')
@@ -83,7 +83,7 @@ class Log(db.Model):
     user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False)
     action_type = db.Column('ActionType', Enum('login', 'logout', 'change', name='action_type_enum'), nullable=False)
     details = db.Column('Details', db.Text)
-    date_log = db.Column('DateLog', db.DateTime, default=datetime.utcnow)
+    date_log = db.Column('DateLog', db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     def __repr__(self):
         return f'<Log {self.log_id} - {self.action_type}>'
@@ -101,7 +101,41 @@ class Transaction(db.Model):
     transaction_type = db.Column('TransactionType', Enum('buy', 'sell', name='transaction_type_enum'), nullable=False)
     quantity_transac = db.Column('QuantityTransac', db.BigInteger, nullable=False)
     price_transac = db.Column('PriceTransac', db.Numeric(15, 2), nullable=False)
-    date_transac = db.Column('DateTransac', db.DateTime, default=datetime.utcnow)
+    date_transac = db.Column('DateTransac', db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     def __repr__(self):
         return f'<Transaction {self.transaction_id} - {self.transaction_type}>'
+
+
+# =========================
+#  MODEL: MARKET DATA
+# =========================
+class MarketData(db.Model):
+    __tablename__ = 'market_data'
+    
+    id = db.Column('ID', db.Integer, primary_key=True, autoincrement=True)
+    datetime = db.Column('DateTime', db.DateTime, nullable=False, index=True)
+    instrument = db.Column('Instrument', db.String(10), nullable=False, index=True)
+    
+    open = db.Column('Open', db.Numeric(15, 4), nullable=False)
+    high = db.Column('High', db.Numeric(15, 4), nullable=False)
+    low = db.Column('Low', db.Numeric(15, 4), nullable=False)
+    close = db.Column('Close', db.Numeric(15, 4), nullable=False)
+    volume = db.Column('Volume', db.BigInteger, nullable=False)
+    
+    vwap = db.Column('VWAP', db.Numeric(15, 4))  # Volume-weighted average price
+    amount = db.Column('Amount', db.Numeric(20, 2))  # Dollar value traded
+    factor = db.Column('Factor', db.Numeric(10, 6), default=1.0)  # Adjustment factor for splits
+    turnover = db.Column('Turnover', db.Numeric(10, 6))  # Volume / float shares
+    float_shares = db.Column('FloatShares', db.BigInteger)  # Outstanding shares
+    
+    created_at = db.Column('CreatedAt', db.DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    # Unique constraint to prevent duplicate entries for same symbol and datetime
+    __table_args__ = (
+        db.UniqueConstraint('Instrument', 'DateTime', name='uq_instrument_datetime'),
+        db.Index('idx_instrument_datetime', 'Instrument', 'DateTime'),
+    )
+
+    def __repr__(self):
+        return f'<MarketData {self.instrument} @ {self.datetime}>'
