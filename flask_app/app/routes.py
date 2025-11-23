@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from sqlalchemy import select, func
 from . import db, jwt
-from .models import User, Stock, Transaction, Score
+from .models import User, Stock, Account, Holding, Transaction, Score
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from .services import upsert_user, upsert_stock, add_transaction, search_stocks
 from .seed import seed_database
@@ -285,6 +285,179 @@ def _stocks_to_json(stocks):
             'country': stock.country,
             'price': float(stock.price),
             'quantity': stock.quantity,
+            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
+        }
+        for stock in stocks
+    ]
+
+
+# =========================
+#  ACCOUNT ROUTES
+# =========================
+
+@routes_bp.route('/accounts', methods=['GET'])
+@jwt_required()
+def get_user_account():
+    """Get the account for the authenticated user"""
+    user_id = get_jwt_identity()
+    account = Account.query.filter_by(user_id=user_id).first()
+    
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
+    
+    return jsonify({
+        'account_id': account.account_id,
+        'user_id': account.user_id,
+        'balance': float(account.balance),
+        'created_at': account.created_at.isoformat() if account.created_at else None,
+        'updated_at': account.updated_at.isoformat() if account.updated_at else None
+    }), 200
+
+
+@routes_bp.route('/accounts', methods=['POST'])
+@jwt_required()
+def create_account():
+    """Create an account for the authenticated user (only one account per user)"""
+    user_id = get_jwt_identity()
+    
+    # Check if account already exists
+    existing_account = Account.query.filter_by(user_id=user_id).first()
+    if existing_account:
+        return jsonify({'error': 'Account already exists for this user'}), 400
+    
+    data = request.get_json()
+    account = Account(
+        user_id=user_id,
+        balance=data.get('balance', 0.00)
+    )
+    db.session.add(account)
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Account created successfully',
+        'account_id': account.account_id,
+        'user_id': account.user_id,
+        'balance': float(account.balance)
+    }), 201
+
+
+@routes_bp.route('/accounts', methods=['PUT'])
+@jwt_required()
+def update_account():
+    """Update the account balance for the authenticated user"""
+    user_id = get_jwt_identity()
+    account = Account.query.filter_by(user_id=user_id).first()
+    
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
+    
+    data = request.get_json()
+    if 'balance' in data:
+        account.balance = data['balance']
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Account updated successfully',
+        'account_id': account.account_id,
+        'balance': float(account.balance),
+        'updated_at': account.updated_at.isoformat() if account.updated_at else None
+    }), 200
+
+
+# =========================
+#  HOLDING ROUTES
+# =========================
+
+@routes_bp.route('/holdings', methods=['GET'])
+@jwt_required()
+def get_user_holdings():
+    """Get all holdings for the authenticated user, sorted alphabetically by stock symbol"""
+    user_id = get_jwt_identity()
+    
+    # Query holdings with joined stock data, filter by user_id, sort by stock symbol
+    holdings = db.session.query(Holding, Stock)\
+        .join(Stock, Holding.stock_id == Stock.stock_id)\
+        .filter(Holding.user_id == user_id)\
+        .order_by(Stock.symbol)\
+        .all()
+    
+    holdings_data = []
+    for holding, stock in holdings:
+        holdings_data.append({
+            'holding_id': holding.holding_id,
+            'user_id': holding.user_id,
+            'stock_id': holding.stock_id,
+            'stock_symbol': stock.symbol,
+            'stock_company': stock.company,
+            'stock_price': float(stock.price) if stock.price else None,
+            'quantity': holding.quantity,
+            'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
+        })
+    
+    return jsonify(holdings_data), 200
+
+
+@routes_bp.route('/holdings', methods=['POST'])
+@jwt_required()
+def create_or_update_holding():
+    """Create or update a holding for the authenticated user"""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    stock_id = data.get('stock_id')
+    quantity = data.get('quantity', 0)
+    
+    if not stock_id:
+        return jsonify({'error': 'stock_id is required'}), 400
+    
+    # Check if stock exists
+    stock = Stock.query.get(stock_id)
+    if not stock:
+        return jsonify({'error': 'Stock not found'}), 404
+    
+    # Check if holding already exists
+    holding = Holding.query.filter_by(user_id=user_id, stock_id=stock_id).first()
+    
+    if holding:
+        # Update existing holding
+        holding.quantity = quantity
+        message = 'Holding updated successfully'
+    else:
+        # Create new holding
+        holding = Holding(
+            user_id=user_id,
+            stock_id=stock_id,
+            quantity=quantity
+        )
+        db.session.add(holding)
+        message = 'Holding created successfully'
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': message,
+        'holding_id': holding.holding_id,
+        'user_id': holding.user_id,
+        'stock_id': holding.stock_id,
+        'quantity': holding.quantity
+    }), 201
+
+
+@routes_bp.route('/holdings/<int:holding_id>', methods=['DELETE'])
+@jwt_required()
+def delete_holding(holding_id):
+    """Delete a specific holding for the authenticated user"""
+    user_id = get_jwt_identity()
+    holding = Holding.query.filter_by(holding_id=holding_id, user_id=user_id).first()
+    
+    if not holding:
+        return jsonify({'error': 'Holding not found'}), 404
+    
+    db.session.delete(holding)
+    db.session.commit()
+    
+    return jsonify({'message': 'Holding deleted successfully'}), 200
             'last_updated': stock.last_updated.isoformat() if stock.last_updated else None,
             'change': change_abs,
             'change_pct': change_pct,
