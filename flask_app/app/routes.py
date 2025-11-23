@@ -1,10 +1,11 @@
 from flask import Blueprint, request, jsonify
 from sqlalchemy import select, case
 from . import db, jwt
-from .models import User, Stock
+from .models import User, Stock, Account, Holding
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from .services import upsert_user, upsert_stock, add_transaction, search_stocks
 from .seed import seed_database
+from datetime import datetime
 
 routes_bp = Blueprint('routes', __name__)
 
@@ -192,6 +193,114 @@ def search_stocks_endpoint():
     ]
     
     return jsonify(stocks_data), 200
+
+@routes_bp.route('/accounts', methods=['POST'])
+def create_account():
+    """Create an account for a user. Body: { "user_id": int, "balance": "decimal" (optional) }"""
+    data = request.get_json() or {}
+    user_id = data.get('user_id')
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"error": "user not found"}), 404
+
+    existing = db.session.execute(db.select(Account).filter_by(user_id=user_id)).scalar_one_or_none()
+    if existing:
+        return jsonify({"error": "account already exists for user"}), 409
+
+    balance = data.get('balance', 0)
+    account = Account(user_id=user_id, balance=balance)
+    db.session.add(account)
+    db.session.commit()
+
+    return jsonify({
+        "account_id": account.account_id,
+        "user_id": account.user_id,
+        "balance": str(account.balance),
+        "created_at": account.created_at.isoformat()
+    }), 201
+
+
+@routes_bp.route('/users/<int:user_id>/account', methods=['GET'])
+def get_account(user_id):
+    acct = db.session.execute(db.select(Account).filter_by(user_id=user_id)).scalar_one_or_none()
+    if not acct:
+        return jsonify({"error": "account not found"}), 404
+    return jsonify({
+        "account_id": acct.account_id,
+        "user_id": acct.user_id,
+        "balance": str(acct.balance),
+        "created_at": acct.created_at.isoformat(),
+        "updated_at": acct.updated_at.isoformat() if acct.updated_at else None
+    })
+
+
+@routes_bp.route('/users/<int:user_id>/portfolio', methods=['GET'])
+def get_portfolio(user_id):
+    """Return all holdings for a user (with basic stock info)."""
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"error": "user not found"}), 404
+
+    stmt = db.select(Holding, Stock).join(Stock, Holding.stock_id == Stock.stock_id).filter(Holding.user_id == user_id)
+    rows = db.session.execute(stmt).all()
+
+    holdings = []
+    for holding, stock in rows:
+        holdings.append({
+            "holding_id": holding.holding_id,
+            "user_id": holding.user_id,
+            "stock_id": holding.stock_id,
+            "symbol": stock.symbol,
+            "company": stock.company,
+            "quantity": int(holding.quantity),
+            "updated_at": holding.updated_at.isoformat() if holding.updated_at else None
+        })
+
+    return jsonify({"holdings": holdings})
+
+
+@routes_bp.route('/holdings', methods=['POST'])
+def upsert_holding():
+    """
+    Upsert a holding.
+    Body: { "user_id": int, "stock_id": int, "quantity": int }
+    If the holding exists, it will be updated to the provided quantity (replace).
+    """
+    data = request.get_json() or {}
+    user_id = data.get('user_id')
+    stock_id = data.get('stock_id')
+    quantity = data.get('quantity')
+
+    if user_id is None or stock_id is None or quantity is None:
+        return jsonify({"error": "user_id, stock_id, quantity are required"}), 400
+
+    user = db.session.get(User, user_id)
+    stock = db.session.get(Stock, stock_id)
+    if not user or not stock:
+        return jsonify({"error": "user or stock not found"}), 404
+
+    stmt = db.select(Holding).filter_by(user_id=user_id, stock_id=stock_id)
+    holding = db.session.execute(stmt).scalar_one_or_none()
+
+    if holding:
+        holding.quantity = int(quantity)
+        holding.updated_at = datetime.utcnow()
+    else:
+        holding = Holding(user_id=user_id, stock_id=stock_id, quantity=int(quantity))
+        db.session.add(holding)
+
+    db.session.commit()
+
+    return jsonify({
+        "holding_id": holding.holding_id,
+        "user_id": holding.user_id,
+        "stock_id": holding.stock_id,
+        "quantity": int(holding.quantity),
+        "updated_at": holding.updated_at.isoformat() if holding.updated_at else None
+    }), 200
 
 def _stocks_to_json(stocks):
     return [

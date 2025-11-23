@@ -20,6 +20,10 @@ class User(db.Model):
     logs = db.relationship('Log', backref='user', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('Transaction', backref='user', lazy=True, cascade='all, delete-orphan')
 
+    # one-to-one account and holdings (portfolio)
+    account = db.relationship('Account', backref='user', uselist=False, cascade='all, delete-orphan')
+    holdings = db.relationship('Holding', backref='user', lazy=True, cascade='all, delete-orphan')
+
     def set_password(self, password):
         """Hash and set the user's password"""
         self.password = bcrypt.generate_password_hash(password).decode('utf-8')
@@ -51,6 +55,9 @@ class Stock(db.Model):
     # Relationships
     scores = db.relationship('Score', backref='stock', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('Transaction', backref='stock', lazy=True, cascade='all, delete-orphan')
+
+    #holdings relationship (portfolio)
+    holdings = db.relationship('Holding', backref='stock', lazy=True, cascade='all, delete-orphan')
 
     def __repr__(self):
         return f'<Stock {self.symbol} - {self.company}>'
@@ -105,3 +112,37 @@ class Transaction(db.Model):
 
     def __repr__(self):
         return f'<Transaction {self.transaction_id} - {self.transaction_type}>'
+
+# =========================
+# ADDED: ACCOUNTS (one-to-one with users)
+# =========================
+class Account(db.Model):
+    __tablename__ = 'accounts'
+
+    account_id = db.Column('AccountID', db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False, unique=True)
+    balance = db.Column('Balance', db.Numeric(15, 2), nullable=False, default=0.00)
+    created_at = db.Column('CreatedAt', db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column('UpdatedAt', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Account {self.account_id} for User {self.user_id}>'
+
+
+# =========================
+# ADDED: HOLDINGS / PORTFOLIO
+# =========================
+class Holding(db.Model):
+    __tablename__ = 'holdings'
+
+    holding_id = db.Column('HoldingID', db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False)
+    stock_id = db.Column('StockID', db.Integer, db.ForeignKey('stocks.StockID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False)
+    quantity = db.Column('Quantity', db.BigInteger, nullable=False, default=0)
+    updated_at = db.Column('UpdatedAt', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # optional uniqueness constraint: one holding per user+stock
+    __table_args__ = (db.UniqueConstraint('UserID', 'StockID', name='uq_user_stock'),)
+
+    def __repr__(self):
+        return f'<Holding {self.holding_id} user {self.user_id} stock {self.stock_id} qty {self.quantity}>'
