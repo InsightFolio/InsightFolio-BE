@@ -3,7 +3,7 @@ from sqlalchemy import select, func
 from . import db, jwt
 from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .services import upsert_user, upsert_stock, add_transaction, search_stocks, create_market_data_from_yahoo
+from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo
 from .seed import seed_database
 import yfinance as yf
 from datetime import datetime, timezone
@@ -70,6 +70,124 @@ def create_transaction():
     )
     db.session.commit()
     return jsonify({"transaction_id": t.transaction_id}), 201
+
+
+@routes_bp.route('/transactions/execute', methods=['POST'])
+@jwt_required()
+def execute_transaction():
+    """
+    Execute a complete transaction (buy/sell) for the authenticated user.
+    Updates account balance and holdings automatically.
+    Price is automatically fetched from the stock's current price.
+    
+    Request body:
+    {
+        "stock_id": 1,
+        "transaction_type": "buy" or "sell",
+        "quantity": 10
+    }
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    try:
+        stock_id = data.get("stock_id")
+        txn_type = data.get("transaction_type")
+        qty = int(data.get("quantity", 0))
+        
+        if not stock_id or not txn_type:
+            return jsonify({'error': 'stock_id and transaction_type are required'}), 400
+        
+        if qty <= 0:
+            return jsonify({'error': 'quantity must be greater than 0'}), 400
+        
+        # Process the transaction (price is fetched from stock table)
+        transaction = process_transaction(
+            user_id=int(user_id),
+            stock_id=stock_id,
+            txn_type=txn_type,
+            qty=qty
+        )
+        db.session.commit()
+        
+        # Get updated account balance
+        account = Account.query.filter_by(user_id=user_id).first()
+        
+        return jsonify({
+            'message': f'Transaction executed successfully',
+            'transaction_id': transaction.transaction_id,
+            'transaction_type': transaction.transaction_type,
+            'quantity': transaction.quantity_transac,
+            'price': float(transaction.price_transac),
+            'total': float(transaction.price_transac * transaction.quantity_transac),
+            'new_balance': float(account.balance) if account else None
+        }), 201
+        
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Transaction failed: {str(e)}'}), 500
+
+
+
+@routes_bp.route('/transactions', methods=['GET'])
+@jwt_required()
+def get_user_transactions():
+    """Get all transactions for the authenticated user, sorted by date (newest first)"""
+    user_id = get_jwt_identity()
+    
+    # Query transactions with joined stock data, filter by user_id, sort by date descending
+    transactions = db.session.query(Transaction, Stock)\
+        .join(Stock, Transaction.stock_id == Stock.stock_id)\
+        .filter(Transaction.user_id == user_id)\
+        .order_by(Transaction.date_transac.desc())\
+        .all()
+    
+    transactions_data = []
+    for transaction, stock in transactions:
+        transactions_data.append({
+            'transaction_id': transaction.transaction_id,
+            'user_id': transaction.user_id,
+            'stock_id': transaction.stock_id,
+            'stock_symbol': stock.symbol,
+            'stock_company': stock.company,
+            'transaction_type': transaction.transaction_type,
+            'quantity': transaction.quantity_transac,
+            'price': float(transaction.price_transac),
+            'date': transaction.date_transac.isoformat() if transaction.date_transac else None
+        })
+    
+    return jsonify(transactions_data), 200
+
+
+@routes_bp.route('/transactions/<int:transaction_id>', methods=['GET'])
+@jwt_required()
+def get_transaction(transaction_id):
+    """Get a specific transaction for the authenticated user"""
+    user_id = get_jwt_identity()
+    
+    transaction = Transaction.query.filter_by(
+        transaction_id=transaction_id,
+        user_id=user_id
+    ).first()
+    
+    if not transaction:
+        return jsonify({'error': 'Transaction not found'}), 404
+    
+    stock = Stock.query.get(transaction.stock_id)
+    
+    return jsonify({
+        'transaction_id': transaction.transaction_id,
+        'user_id': transaction.user_id,
+        'stock_id': transaction.stock_id,
+        'stock_symbol': stock.symbol if stock else None,
+        'stock_company': stock.company if stock else None,
+        'transaction_type': transaction.transaction_type,
+        'quantity': transaction.quantity_transac,
+        'price': float(transaction.price_transac),
+        'date': transaction.date_transac.isoformat() if transaction.date_transac else None
+    }), 200
     
 @routes_bp.route('/seed_database', methods=['POST'])
 def seed_database_endpoint():
@@ -641,3 +759,172 @@ def _get_growth_map(stock_ids):
         .join(latest_score_subq, Score.score_id == latest_score_subq.c.max_id)
     ).all()
     return {stock_id: float(growth or 0) for stock_id, growth in scores}
+
+
+# =========================
+#  ACCOUNT ROUTES
+# =========================
+
+@routes_bp.route('/accounts', methods=['GET'])
+@jwt_required()
+def get_user_account():
+    """Get the account for the authenticated user"""
+    user_id = get_jwt_identity()
+    account = Account.query.filter_by(user_id=user_id).first()
+    
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
+    
+    return jsonify({
+        'account_id': account.account_id,
+        'user_id': account.user_id,
+        'balance': float(account.balance),
+        'created_at': account.created_at.isoformat() if account.created_at else None,
+        'updated_at': account.updated_at.isoformat() if account.updated_at else None
+    }), 200
+
+
+@routes_bp.route('/accounts', methods=['POST'])
+@jwt_required()
+def create_account():
+    """Create an account for the authenticated user (only one account per user)"""
+    user_id = get_jwt_identity()
+    
+    # Check if account already exists
+    existing_account = Account.query.filter_by(user_id=user_id).first()
+    if existing_account:
+        return jsonify({'error': 'Account already exists for this user'}), 400
+    
+    data = request.get_json()
+    account = Account(
+        user_id=user_id,
+        balance=data.get('balance', 0.00)
+    )
+    db.session.add(account)
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Account created successfully',
+        'account_id': account.account_id,
+        'user_id': account.user_id,
+        'balance': float(account.balance)
+    }), 201
+
+
+@routes_bp.route('/accounts', methods=['PUT'])
+@jwt_required()
+def update_account():
+    """Update the account balance for the authenticated user"""
+    user_id = get_jwt_identity()
+    account = Account.query.filter_by(user_id=user_id).first()
+    
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
+    
+    data = request.get_json()
+    if 'balance' in data:
+        account.balance = data['balance']
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Account updated successfully',
+        'account_id': account.account_id,
+        'balance': float(account.balance),
+        'updated_at': account.updated_at.isoformat() if account.updated_at else None
+    }), 200
+
+
+# =========================
+#  HOLDING ROUTES
+# =========================
+
+@routes_bp.route('/holdings', methods=['GET'])
+@jwt_required()
+def get_user_holdings():
+    """Get all holdings for the authenticated user, sorted alphabetically by stock symbol"""
+    user_id = get_jwt_identity()
+    
+    # Query holdings with joined stock data, filter by user_id, sort by stock symbol
+    holdings = db.session.query(Holding, Stock)\
+        .join(Stock, Holding.stock_id == Stock.stock_id)\
+        .filter(Holding.user_id == user_id)\
+        .order_by(Stock.symbol)\
+        .all()
+    
+    holdings_data = []
+    for holding, stock in holdings:
+        holdings_data.append({
+            'holding_id': holding.holding_id,
+            'user_id': holding.user_id,
+            'stock_id': holding.stock_id,
+            'stock_symbol': stock.symbol,
+            'stock_company': stock.company,
+            'stock_price': float(stock.price) if stock.price else None,
+            'quantity': holding.quantity,
+            'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
+        })
+    
+    return jsonify(holdings_data), 200
+
+
+@routes_bp.route('/holdings', methods=['POST'])
+@jwt_required()
+def create_or_update_holding():
+    """Create or update a holding for the authenticated user"""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    stock_id = data.get('stock_id')
+    quantity = data.get('quantity', 0)
+    
+    if not stock_id:
+        return jsonify({'error': 'stock_id is required'}), 400
+    
+    # Check if stock exists
+    stock = Stock.query.get(stock_id)
+    if not stock:
+        return jsonify({'error': 'Stock not found'}), 404
+    
+    # Check if holding already exists
+    holding = Holding.query.filter_by(user_id=user_id, stock_id=stock_id).first()
+    
+    if holding:
+        # Update existing holding
+        holding.quantity = quantity
+        message = 'Holding updated successfully'
+    else:
+        # Create new holding
+        holding = Holding(
+            user_id=user_id,
+            stock_id=stock_id,
+            quantity=quantity
+        )
+        db.session.add(holding)
+        message = 'Holding created successfully'
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': message,
+        'holding_id': holding.holding_id,
+        'user_id': holding.user_id,
+        'stock_id': holding.stock_id,
+        'quantity': holding.quantity
+    }), 201
+
+
+@routes_bp.route('/holdings/<int:holding_id>', methods=['DELETE'])
+@jwt_required()
+def delete_holding(holding_id):
+    """Delete a specific holding for the authenticated user"""
+    user_id = get_jwt_identity()
+    holding = Holding.query.filter_by(holding_id=holding_id, user_id=user_id).first()
+    
+    if not holding:
+        return jsonify({'error': 'Holding not found'}), 404
+    
+    db.session.delete(holding)
+    db.session.commit()
+    
+    return jsonify({'message': 'Holding deleted successfully'}), 200
