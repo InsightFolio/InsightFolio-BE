@@ -1,6 +1,9 @@
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from .extensions import db
-from .models import User, Stock, Score, Log, Transaction
+from .models import User, Score, Log, Account, Holding, Stock, Transaction
 
 # USERS
 def upsert_user(username: str, email: str, password_plain: str, balance=0.0, risk_averse='no') -> User:
@@ -98,3 +101,114 @@ def search_stocks(text: str, country: str = "", min_price: float = 0, max_price:
     
     results = db.session.execute(query).scalars().all()
     return results
+
+def process_holding_update(user_id: int, stock_id: int, new_quantity: int):
+    """
+    Atomically process change to a user's holding with row-level locks to avoid races.
+    """
+    if new_quantity < 0:
+        raise ValueError("new_quantity must be >= 0")
+
+    session = db.session
+
+    # simple retry loop for transient serialization/lock errors could be added here
+    try:
+        with session.begin():
+            # lock account row
+            account = session.execute(
+                select(Account).filter_by(user_id=user_id).with_for_update()
+            ).scalar_one_or_none()
+            if not account:
+                raise ValueError("account not found")
+
+            # lock stock row (optional, but prevents price changes racing)
+            stock = session.execute(
+                select(Stock).filter_by(stock_id=stock_id).with_for_update()
+            ).scalar_one_or_none()
+            if not stock:
+                raise ValueError("stock not found")
+
+            # lock existing holding row if present
+            holding = session.execute(
+                select(Holding).filter_by(user_id=user_id, stock_id=stock_id).with_for_update()
+            ).scalar_one_or_none()
+
+            old_qty = int(holding.quantity) if holding else 0
+            delta = int(new_quantity) - old_qty
+
+            try:
+                price = Decimal(str(stock.price)) if stock.price is not None else Decimal('0')
+            except (InvalidOperation, TypeError):
+                price = Decimal('0')
+
+            txns = []
+            now = datetime.utcnow()
+
+            if delta == 0:
+                if not holding and new_quantity > 0:
+                    holding = Holding(user_id=user_id, stock_id=stock_id, quantity=int(new_quantity), updated_at=now)
+                    session.add(holding)
+            elif delta > 0:
+                cost = (price * Decimal(delta)).quantize(Decimal("0.01"))
+                acc_bal = Decimal(str(account.balance or 0))
+                if acc_bal < cost:
+                    raise ValueError("insufficient funds")
+                account.balance = (acc_bal - cost)
+                if holding:
+                    holding.quantity = int(new_quantity)
+                    holding.updated_at = now
+                else:
+                    holding = Holding(user_id=user_id, stock_id=stock_id, quantity=int(new_quantity), updated_at=now)
+                    session.add(holding)
+                txn = Transaction(
+                    user_id=user_id,
+                    stock_id=stock_id,
+                    transaction_type='buy',
+                    quantity_transac=delta,
+                    price_transac=price,
+                    date_transac=now
+                )
+                session.add(txn)
+                txns.append(txn)
+            else:
+                sell_qty = -delta
+                if old_qty < sell_qty:
+                    raise ValueError("not enough shares to sell")
+                proceeds = (price * Decimal(sell_qty)).quantize(Decimal("0.01"))
+                acc_bal = Decimal(str(account.balance or 0))
+                account.balance = (acc_bal + proceeds)
+                remaining = old_qty - sell_qty
+                if remaining <= 0:
+                    if holding:
+                        session.delete(holding)
+                    holding = None
+                else:
+                    holding.quantity = int(remaining)
+                    holding.updated_at = now
+                txn = Transaction(
+                    user_id=user_id,
+                    stock_id=stock_id,
+                    transaction_type='sell',
+                    quantity_transac=sell_qty,
+                    price_transac=price,
+                    date_transac=now
+                )
+                session.add(txn)
+                txns.append(txn)
+
+            # flush & refresh
+            session.flush()
+            if holding:
+                session.refresh(holding)
+            session.refresh(account)
+            for t in txns:
+                session.refresh(t)
+
+    except IntegrityError:
+        # consider retry or return a specific error to caller
+        raise
+    except SQLAlchemyError:
+        # rollback will happen automatically on exception
+        raise
+
+    return {"holding": holding, "account": account, "transactions": txns}
