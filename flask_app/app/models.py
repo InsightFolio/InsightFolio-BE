@@ -19,6 +19,8 @@ class User(db.Model):
     # Relationships
     logs = db.relationship('Log', backref='user', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('Transaction', backref='user', lazy=True, cascade='all, delete-orphan')
+    account = db.relationship('Account', backref='user', uselist=False, lazy=True, cascade='all, delete-orphan')
+    holdings = db.relationship('Holding', backref='user', lazy=True, cascade='all, delete-orphan')
 
     def set_password(self, password):
         """Hash and set the user's password"""
@@ -51,6 +53,7 @@ class Stock(db.Model):
     # Relationships
     scores = db.relationship('Score', backref='stock', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('Transaction', backref='stock', lazy=True, cascade='all, delete-orphan')
+    holdings = db.relationship('Holding', backref='stock', lazy=True, cascade='all, delete-orphan')
 
     def __repr__(self):
         return f'<Stock {self.symbol} - {self.company}>'
@@ -139,3 +142,32 @@ class MarketData(db.Model):
 
     def __repr__(self):
         return f'<MarketData {self.instrument} @ {self.datetime}>'
+#  MODEL: ACCOUNT
+# =========================
+class Account(db.Model):
+    __tablename__ = 'accounts'
+    
+    account_id = db.Column('AccountID', db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), unique=True, nullable=False)
+    balance = db.Column('Balance', db.Numeric(15, 2), default=0.00, nullable=False)
+    created_at = db.Column('CreatedAt', db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column('UpdatedAt', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Account {self.account_id} - User {self.user_id}>'
+
+
+# =========================
+#  MODEL: HOLDING
+# =========================
+class Holding(db.Model):
+    __tablename__ = 'holdings'
+    
+    holding_id = db.Column('HoldingID', db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False)
+    stock_id = db.Column('StockID', db.Integer, db.ForeignKey('stocks.StockID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False)
+    quantity = db.Column('Quantity', db.BigInteger, default=0, nullable=False)
+    updated_at = db.Column('UpdatedAt', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Holding {self.holding_id} - User {self.user_id} Stock {self.stock_id}>'
