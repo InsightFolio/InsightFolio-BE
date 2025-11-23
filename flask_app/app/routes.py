@@ -1,10 +1,12 @@
 from flask import Blueprint, request, jsonify
 from sqlalchemy import select, func
 from . import db, jwt
-from .models import User, Stock, Account, Holding, Transaction, Score
+from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .services import upsert_user, upsert_stock, add_transaction, search_stocks
+from .services import upsert_user, upsert_stock, add_transaction, search_stocks, create_market_data_from_yahoo
 from .seed import seed_database
+import yfinance as yf
+from datetime import datetime, timezone
 
 routes_bp = Blueprint('routes', __name__)
 
@@ -144,7 +146,6 @@ def popular_stocks():
 
     return jsonify(response), 200
 
-@routes_bp.route('/api/stocks/search', methods=['GET'])
 @routes_bp.route('/search', methods=['POST'])
 def search_stocks_endpoint():
     """
@@ -153,11 +154,11 @@ def search_stocks_endpoint():
     {
         "text": "",
         "filters": {
-            "country": "",
+            "country": "" or ["USA", "Canada"],
             "min_price": 0,
             "max_price": 100,
-            "sector": "",
-            "sub_sector": ""
+            "sector": "" or ["Technology", "Healthcare"],
+            "sub_sector": "" or ["Software", "Biotechnology"]
         }
     }
     """
@@ -166,11 +167,12 @@ def search_stocks_endpoint():
     text = data.get('text', '')
     filters = data.get('filters', {})
     
-    country = filters.get('country', '')
+    # These can be either strings or lists
+    country = filters.get('country', None)
     min_price = float(filters.get('min_price', 0))
     max_price = float(filters.get('max_price', 0))
-    sector = filters.get('sector', '')
-    sub_sector = filters.get('sub_sector', '')
+    sector = filters.get('sector', None)
+    sub_sector = filters.get('sub_sector', None)
     
     results = search_stocks(
         text=text,
@@ -181,23 +183,7 @@ def search_stocks_endpoint():
         sub_sector=sub_sector
     )
     
-    # Convert results to JSON-serializable format
-    stocks_data = [
-        {
-            'stock_id': stock.stock_id,
-            'symbol': stock.symbol,
-            'company': stock.company,
-            'sector': stock.sector,
-            'sub_sector': stock.sub_sector,
-            'country': stock.country,
-            'price': float(stock.price),
-            'quantity': stock.quantity,
-            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
-        }
-        for stock in results
-    ]
-    
-    return jsonify(stocks_data), 200
+    return jsonify(_stocks_to_json(results)), 200
 
 @routes_bp.route('/stockbyscore', methods=['GET'])
 def stock_by_score():
@@ -289,6 +275,187 @@ def _stocks_to_json(stocks):
         }
         for stock in stocks
     ]
+
+@routes_bp.route('/stocks/<symbol>', methods=['GET'])
+def get_stock_by_symbol(symbol):
+    """
+    Get a single stock from the database by symbol.
+    
+    GET /stocks/AAPL
+    
+    Returns:
+    {
+        "stock_id": 123,
+        "symbol": "AAPL",
+        "company": "Apple Inc.",
+        "sector": "Technology",
+        "sub_sector": "Consumer Electronics",
+        "country": "USA",
+        "price": 150.25,
+        "quantity": 15000000000,
+        "last_updated": "2025-11-22T10:30:00"
+    }
+    """
+    stock = db.session.execute(
+        select(Stock).where(Stock.symbol == symbol.upper())
+    ).scalar_one_or_none()
+    
+    if not stock:
+        return jsonify({'error': f'Stock {symbol.upper()} not found'}), 404
+    
+    return jsonify({
+        'stock_id': stock.stock_id,
+        'symbol': stock.symbol,
+        'company': stock.company,
+        'sector': stock.sector,
+        'sub_sector': stock.sub_sector,
+        'country': stock.country,
+        'price': float(stock.price),
+        'quantity': stock.quantity,
+        'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
+    }), 200
+
+@routes_bp.route('/yahoo/<symbol>', methods=['GET'])
+def get_yahoo_finance_data(symbol):
+    """
+    Fetch real-time stock data from Yahoo Finance.
+    
+    GET /yahoo/AAPL
+    
+    Returns:
+    {
+        "symbol": "AAPL",
+        "company": "Apple Inc.",
+        "sector": "Technology",
+        "industry": "Consumer Electronics",
+        "price": 150.25,
+        "quantity": 15000000000,
+        "country": "United States"
+    }
+    """
+    try:
+        ticker = yf.Ticker(symbol.upper())
+        info = ticker.info
+        
+        return jsonify({
+            'symbol': symbol.upper(),
+            'company': info.get('longName') or info.get('shortName'),
+            'sector': info.get('sector'),
+            'industry': info.get('industry'),
+            'price': info.get('currentPrice') or info.get('regularMarketPrice'),
+            'quantity': info.get('sharesOutstanding'),
+            'country': info.get('country'),
+            'market_cap': info.get('marketCap'),
+            'pe_ratio': info.get('trailingPE'),
+            'dividend_yield': info.get('dividendYield'),
+            'week_52_high': info.get('fiftyTwoWeekHigh'),
+            'week_52_low': info.get('fiftyTwoWeekLow')
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': f'Failed to fetch data for {symbol}',
+            'details': str(e)
+        }), 404
+
+@routes_bp.route('/market-data/<symbol>', methods=['GET'])
+def get_market_data(symbol):
+    """
+    Get the latest market data for a symbol from the database.
+    
+    GET /market-data/AAPL
+    
+    Returns:
+    {
+        "id": 123,
+        "datetime": "2025-11-23T16:00:00",
+        "instrument": "AAPL",
+        "open": 265.88,
+        "high": 273.315,
+        "low": 265.82,
+        "close": 271.49,
+        "volume": 59030832,
+        "vwap": 269.50,
+        "amount": 15900000000.00,
+        "factor": 1.0,
+        "turnover": 0.004,
+        "float_shares": 14776353000
+    }
+    """
+    market_data = db.session.execute(
+        select(MarketData)
+        .where(MarketData.instrument == symbol.upper())
+        .order_by(MarketData.datetime.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    
+    if not market_data:
+        return jsonify({'error': f'No market data found for {symbol.upper()}'}), 404
+    
+    return jsonify({
+        'id': market_data.id,
+        'datetime': market_data.datetime.isoformat(),
+        'instrument': market_data.instrument,
+        'open': float(market_data.open),
+        'high': float(market_data.high),
+        'low': float(market_data.low),
+        'close': float(market_data.close),
+        'volume': market_data.volume,
+        'vwap': float(market_data.vwap) if market_data.vwap else None,
+        'amount': float(market_data.amount) if market_data.amount else None,
+        'factor': float(market_data.factor) if market_data.factor else None,
+        'turnover': float(market_data.turnover) if market_data.turnover else None,
+        'float_shares': market_data.float_shares
+    }), 200
+
+@routes_bp.route('/market-data/<symbol>/populate', methods=['POST'])
+def populate_market_data(symbol):
+    """
+    Fetch today's market data from Yahoo Finance and store it in the database.
+    
+    POST /market-data/AAPL/populate
+    
+    Creates a new market_data record with today's OHLCV data plus calculated metrics.
+    Factor is calculated as the cumulative split adjustment multiplier.
+    """
+    try:
+        market_data = create_market_data_from_yahoo(symbol)
+        
+        db.session.add(market_data)
+        db.session.commit()
+        
+        return jsonify({
+            'message': f'Market data for {symbol.upper()} created successfully',
+            'data': {
+                'id': market_data.id,
+                'datetime': market_data.datetime.isoformat(),
+                'instrument': market_data.instrument,
+                'open': float(market_data.open),
+                'high': float(market_data.high),
+                'low': float(market_data.low),
+                'close': float(market_data.close),
+                'volume': market_data.volume,
+                'vwap': float(market_data.vwap) if market_data.vwap else None,
+                'amount': float(market_data.amount) if market_data.amount else None,
+                'factor': float(market_data.factor) if market_data.factor else None,
+                'turnover': float(market_data.turnover) if market_data.turnover else None,
+                'float_shares': market_data.float_shares
+            }
+        }), 201
+        
+    except ValueError as e:
+        return jsonify({
+            'error': f'Failed to populate market data for {symbol}',
+            'details': str(e)
+        }), 400
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'error': f'Failed to populate market data for {symbol}',
+            'details': str(e)
+        }), 500
+
 
 
 # =========================

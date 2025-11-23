@@ -1,6 +1,8 @@
 from sqlalchemy import select
 from .extensions import db
-from .models import User, Stock, Score, Log, Transaction
+from .models import User, Stock, Score, Log, Transaction, MarketData
+import yfinance as yf
+from datetime import datetime, timezone
 
 # USERS
 def upsert_user(username: str, email: str, password_plain: str, balance=0.0, risk_averse='no') -> User:
@@ -56,11 +58,19 @@ def add_transaction(email: str, symbol: str, txn_type: str, qty: int, price: flo
     return txn
 
 # SEARCH STOCKS
-def search_stocks(text: str, country: str = "", min_price: float = 0, max_price: float = 0, 
-                  sector: str = "", sub_sector: str = "") -> list[Stock]:
+def search_stocks(text: str, country=None, min_price: float = 0, max_price: float = 0, 
+                  sector=None, sub_sector=None) -> list[Stock]:
     """
     Search stocks based on text and optional filters.
     Returns first 10 matching results.
+    
+    Args:
+        text: Search text for symbol or company name
+        country: Single country string, list of countries, or None
+        min_price: Minimum price filter
+        max_price: Maximum price filter
+        sector: Single sector string, list of sectors, or None
+        sub_sector: Single sub_sector string, list of sub_sectors, or None
     """
     query = select(Stock)
     
@@ -74,9 +84,12 @@ def search_stocks(text: str, country: str = "", min_price: float = 0, max_price:
             )
         )
     
-    # Apply country filter if provided
+    # Apply country filter - handles both single value and list
     if country:
-        query = query.where(Stock.country == country)
+        if isinstance(country, list) and len(country) > 0:
+            query = query.where(Stock.country.in_(country))
+        elif isinstance(country, str) and country:
+            query = query.where(Stock.country == country)
     
     # Apply price range filter if both min and max are not 0
     if min_price > 0 or max_price > 0:
@@ -85,16 +98,68 @@ def search_stocks(text: str, country: str = "", min_price: float = 0, max_price:
         if max_price > 0:
             query = query.where(Stock.price <= max_price)
     
-    # Apply sector filter if provided
+    # Apply sector filter - handles both single value and list
     if sector:
-        query = query.where(Stock.sector == sector)
+        if isinstance(sector, list) and len(sector) > 0:
+            query = query.where(Stock.sector.in_(sector))
+        elif isinstance(sector, str) and sector:
+            query = query.where(Stock.sector == sector)
     
-    # Apply sub_sector filter if provided
+    # Apply sub_sector filter - handles both single value and list
     if sub_sector:
-        query = query.where(Stock.sub_sector == sub_sector)
+        if isinstance(sub_sector, list) and len(sub_sector) > 0:
+            query = query.where(Stock.sub_sector.in_(sub_sector))
+        elif isinstance(sub_sector, str) and sub_sector:
+            query = query.where(Stock.sub_sector == sub_sector)
     
     # Limit to 10 results
     query = query.limit(10)
     
     results = db.session.execute(query).scalars().all()
     return results
+
+# MARKET DATA
+def create_market_data_from_yahoo(symbol: str) -> MarketData:
+    ticker = yf.Ticker(symbol.upper())
+    info = ticker.info
+    
+    high = info.get('regularMarketDayHigh') or info.get('dayHigh')
+    low = info.get('regularMarketDayLow') or info.get('dayLow')
+    close = info.get('regularMarketPrice') or info.get('currentPrice')
+    open_price = info.get('regularMarketOpen') or info.get('open')
+    volume = info.get('regularMarketVolume') or info.get('volume')
+    
+    if not all([high, low, close, open_price, volume]):
+        raise ValueError(f"Missing required OHLCV data for {symbol}")
+    
+    vwap = (high + low + close) / 3
+    amount = volume * vwap
+    float_shares = info.get('floatShares') or info.get('sharesOutstanding')
+    turnover = (volume / float_shares) if float_shares else None
+    
+    factor = 1.0
+    try:
+        splits = ticker.splits
+        if not splits.empty:
+            # Calculate cumulative product of all split ratios
+            for split_ratio in splits:
+                factor *= split_ratio
+    except Exception:
+        factor = 1.0
+    
+    market_data = MarketData(
+        datetime=datetime.now(timezone.utc),
+        instrument=symbol.upper(),
+        open=open_price,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        vwap=vwap,
+        amount=amount,
+        factor=factor,
+        turnover=turnover,
+        float_shares=float_shares
+    )
+    
+    return market_data
