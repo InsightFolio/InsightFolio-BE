@@ -1,6 +1,7 @@
 from sqlalchemy import select
 from .extensions import db
-from .models import User, Stock, Score, Log, Transaction
+from .models import User, Stock, Score, Log, Transaction, Account, Holding
+from decimal import Decimal
 
 # USERS
 def upsert_user(username: str, email: str, password_plain: str, balance=0.0, risk_averse='no') -> User:
@@ -53,6 +54,107 @@ def add_transaction(email: str, symbol: str, txn_type: str, qty: int, price: flo
     txn = Transaction(user_id=user.user_id, stock_id=stock.stock_id, transaction_type=txn_type,
                       quantity_transac=qty, price_transac=price)
     db.session.add(txn)
+    return txn
+
+
+def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) -> Transaction:
+    """
+    Process a complete transaction: validate, update account, update holdings, and record transaction.
+    Uses current stock price from the database.
+    
+    Args:
+        user_id: ID of the user making the transaction
+        stock_id: ID of the stock being traded
+        txn_type: 'buy' or 'sell'
+        qty: Quantity of shares
+    
+    Returns:
+        Transaction object
+    
+    Raises:
+        ValueError: If validation fails (insufficient funds/holdings/stock not found)
+    """
+    # Get stock and its current price
+    stock = db.session.execute(
+        select(Stock).where(Stock.stock_id == stock_id)
+    ).scalar_one_or_none()
+    
+    if not stock:
+        raise ValueError(f"Stock with ID {stock_id} not found")
+    
+    if not stock.price or stock.price <= 0:
+        raise ValueError(f"Stock {stock.symbol} does not have a valid price")
+    
+    price = stock.price
+    total_cost = Decimal(str(price)) * qty
+    
+    # Get or create account
+    account = db.session.execute(
+        select(Account).where(Account.user_id == user_id)
+    ).scalar_one_or_none()
+    
+    if not account:
+        raise ValueError("Account not found. Please create an account first.")
+    
+    # Validate and update based on transaction type
+    if txn_type == 'buy':
+        # Check if user has enough balance
+        if account.balance < total_cost:
+            raise ValueError(f"Insufficient funds. Balance: {account.balance}, Required: {total_cost}")
+        
+        # Deduct from account balance
+        account.balance -= total_cost
+        
+        # Update or create holding
+        holding = db.session.execute(
+            select(Holding).where(
+                Holding.user_id == user_id,
+                Holding.stock_id == stock_id
+            )
+        ).scalar_one_or_none()
+        
+        if holding:
+            holding.quantity += qty
+        else:
+            holding = Holding(user_id=user_id, stock_id=stock_id, quantity=qty)
+            db.session.add(holding)
+    
+    elif txn_type == 'sell':
+        # Check if user has enough holdings
+        holding = db.session.execute(
+            select(Holding).where(
+                Holding.user_id == user_id,
+                Holding.stock_id == stock_id
+            )
+        ).scalar_one_or_none()
+        
+        if not holding or holding.quantity < qty:
+            current_qty = holding.quantity if holding else 0
+            raise ValueError(f"Insufficient holdings. You have {current_qty} shares, trying to sell {qty}")
+        
+        # Update holding quantity
+        holding.quantity -= qty
+        
+        # Remove holding if quantity becomes 0
+        if holding.quantity == 0:
+            db.session.delete(holding)
+        
+        # Add to account balance
+        account.balance += total_cost
+    
+    else:
+        raise ValueError(f"Invalid transaction type: {txn_type}. Must be 'buy' or 'sell'")
+    
+    # Create transaction record
+    txn = Transaction(
+        user_id=user_id,
+        stock_id=stock_id,
+        transaction_type=txn_type,
+        quantity_transac=qty,
+        price_transac=price
+    )
+    db.session.add(txn)
+    
     return txn
 
 # SEARCH STOCKS
