@@ -288,7 +288,7 @@ def _stocks_to_json(stocks):
             'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
         }
         for stock in stocks
-    ]
+        )   
 
 
 # =========================
@@ -458,11 +458,7 @@ def delete_holding(holding_id):
     db.session.commit()
     
     return jsonify({'message': 'Holding deleted successfully'}), 200
-            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None,
-            'change': change_abs,
-            'change_pct': change_pct,
-        })
-    return result
+        
 
 def _get_growth_map(stock_ids):
     if not stock_ids:
