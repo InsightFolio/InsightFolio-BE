@@ -125,7 +125,7 @@ def build_dataset(config: QlibConfig, symbols: List[str]) -> DatasetH:
 
 def train_model(dataset: DatasetH) -> LGBModel:
     try:
-        model = LGBModel(loss="mape", verbose=-1)
+        model = LGBModel(loss="mse", verbose=-1)
     except NotImplementedError as exc:
         # LightGBM backend missing; provide a clear message for the API surface.
         raise RuntimeError(
@@ -191,9 +191,16 @@ def _resolve_symbols(config: QlibConfig) -> List[str]:
     if config.symbols:
         return config.symbols
 
-    instruments = list(D.instruments(market="all"))
+    instruments = D.list_instruments(
+        instruments="all",
+        start_time=config.start_date,
+        end_time=config.end_date,
+        freq=config.freq if hasattr(config, "freq") else "day",
+        as_list=True,
+    )
     if not instruments:
         raise ValueError(
-            "No instruments found in provider. Ensure QLIB_DATA_PATH points to a valid dataset."
+            "No instruments found in provider for the requested date range. "
+            "Ensure QLIB_DATA_PATH is correct and the date window matches your data."
         )
     return [str(instr) for instr in instruments]

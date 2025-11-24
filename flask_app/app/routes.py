@@ -400,19 +400,22 @@ def _stocks_to_json(stocks):
     for stock in stocks:
         change_pct = growth_map.get(stock.stock_id, 0.0)
         change_abs = float(stock.price or 0) * (change_pct / 100.0) if change_pct else 0.0
-        result.append({
-            'stock_id': stock.stock_id,
-            'symbol': stock.symbol,
-            'company': stock.company,
-            'sector': stock.sector,
-            'sub_sector': stock.sub_sector,
-            'country': stock.country,
-            'price': float(stock.price),
-            'quantity': stock.quantity,
-            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
-        }
-        for stock in stocks
-        )   
+        result.append(
+            {
+                'stock_id': stock.stock_id,
+                'symbol': stock.symbol,
+                'company': stock.company,
+                'sector': stock.sector,
+                'sub_sector': stock.sub_sector,
+                'country': stock.country,
+                'price': float(stock.price),
+                'quantity': stock.quantity,
+                'last_updated': stock.last_updated.isoformat() if stock.last_updated else None,
+                'change': change_abs,
+                'change_pct': change_pct,
+            }
+        )
+    return result
 
 @routes_bp.route('/stocks/<symbol>', methods=['GET'])
 def get_stock_by_symbol(symbol):
