@@ -1,9 +1,6 @@
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
-
 from sqlalchemy import select, func
 from . import db, jwt
-from .scoring import QlibConfig, load_config_from_env, run_scoring_workflow
 from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo
@@ -29,7 +26,7 @@ def login():
     data = request.get_json()
     user = User.query.filter_by(username=data['username']).first() or User.query.filter_by(email=data['username']).first()
     if user and user.check_password(data['password']):
-        token = create_access_token(identity=str(user.id))
+        token = create_access_token(identity=str(user.user_id))
         return jsonify({'token': token}), 200
     return jsonify({'error': 'Invalid credentials'}), 401
 
