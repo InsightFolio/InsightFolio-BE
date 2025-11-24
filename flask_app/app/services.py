@@ -4,17 +4,29 @@ from .models import User, Stock, Score, Log, Transaction, Account, Holding
 from decimal import Decimal
 
 # USERS
-def upsert_user(username: str, email: str, password_plain: str, balance=0.0, risk_averse='no') -> User:
+def upsert_user(username: str, email: str, password_plain: str, balance=10000.0, risk_averse='no') -> User:
     user = db.session.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if user is None:
-        user = User(username=username, email=email, balance=balance, risk_averse=risk_averse)
+        user = User(username=username, email=email, risk_averse=risk_averse)
         user.set_password(password_plain)
         db.session.add(user)
+        db.session.flush()  # Get user_id
+        
+        # Create account for the user
+        account = Account(user_id=user.user_id, balance=Decimal(str(balance)))
+        db.session.add(account)
     else:
         user.username = username
-        user.balance = balance
         user.risk_averse = risk_averse
         user.set_password(password_plain)  # rotate/update hash as needed
+        
+        # Update or create account
+        account = db.session.execute(select(Account).where(Account.user_id == user.user_id)).scalar_one_or_none()
+        if account:
+            account.balance = Decimal(str(balance))
+        else:
+            account = Account(user_id=user.user_id, balance=Decimal(str(balance)))
+            db.session.add(account)
     return user
 
 # STOCKS
@@ -86,7 +98,7 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
         raise ValueError(f"Stock {stock.symbol} does not have a valid price")
     
     price = stock.price
-    total_cost = Decimal(str(price)) * qty
+    total_cost = Decimal(str(price)) * Decimal(str(qty))
     
     # Get or create account
     account = db.session.execute(
@@ -99,11 +111,12 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
     # Validate and update based on transaction type
     if txn_type == 'buy':
         # Check if user has enough balance
-        if account.balance < total_cost:
-            raise ValueError(f"Insufficient funds. Balance: {account.balance}, Required: {total_cost}")
+        account_balance = Decimal(str(account.balance))
+        if account_balance < total_cost:
+            raise ValueError(f"Insufficient funds. Balance: {account_balance}, Required: {total_cost}")
         
         # Deduct from account balance
-        account.balance -= total_cost
+        account.balance = account_balance - total_cost
         
         # Update or create holding
         holding = db.session.execute(
@@ -140,7 +153,8 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
             db.session.delete(holding)
         
         # Add to account balance
-        account.balance += total_cost
+        account_balance = Decimal(str(account.balance))
+        account.balance = account_balance + total_cost
     
     else:
         raise ValueError(f"Invalid transaction type: {txn_type}. Must be 'buy' or 'sell'")
