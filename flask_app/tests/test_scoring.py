@@ -15,14 +15,14 @@ from flask_app.app.scoring import (
 def test_parse_symbols_handles_string_and_default():
     assert _parse_symbols("AAPL,MSFT") == ["AAPL", "MSFT"]
     assert _parse_symbols(["AAPL"]) == ["AAPL"]
-    assert _parse_symbols(None) == ["AAPL", "MSFT", "GOOG"]
+    assert _parse_symbols(None) == []
 
 
 def test_load_config_from_env(monkeypatch):
     monkeypatch.setenv("QLIB_SYMBOLS", "SPY,QQQ")
     cfg = load_config_from_env()
     assert cfg.symbols == ["SPY", "QQQ"]
-    assert cfg.region == "CN"
+    assert cfg.region == "US"
 
 
 @patch("flask_app.app.scoring.train_model")
