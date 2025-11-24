@@ -1,16 +1,21 @@
 from flask import Blueprint, request, jsonify
 from sqlalchemy import select, func
 from . import db, jwt
-from .models import User, Stock, Transaction, Score, Account, Holding
+from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction
+from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo
 from .seed import seed_database
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 =======
 import yfinance as yf
 from datetime import datetime, timezone
 from decimal import Decimal
 >>>>>>> Stashed changes
+=======
+import yfinance as yf
+from datetime import datetime, timezone
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
 
 routes_bp = Blueprint('routes', __name__)
 
@@ -305,7 +310,6 @@ def popular_stocks():
 
     return jsonify(response), 200
 
-@routes_bp.route('/api/stocks/search', methods=['GET'])
 @routes_bp.route('/search', methods=['POST'])
 def search_stocks_endpoint():
     """
@@ -314,11 +318,11 @@ def search_stocks_endpoint():
     {
         "text": "",
         "filters": {
-            "country": "",
+            "country": "" or ["USA", "Canada"],
             "min_price": 0,
             "max_price": 100,
-            "sector": "",
-            "sub_sector": ""
+            "sector": "" or ["Technology", "Healthcare"],
+            "sub_sector": "" or ["Software", "Biotechnology"]
         }
     }
     """
@@ -327,11 +331,12 @@ def search_stocks_endpoint():
     text = data.get('text', '')
     filters = data.get('filters', {})
     
-    country = filters.get('country', '')
+    # These can be either strings or lists
+    country = filters.get('country', None)
     min_price = float(filters.get('min_price', 0))
     max_price = float(filters.get('max_price', 0))
-    sector = filters.get('sector', '')
-    sub_sector = filters.get('sub_sector', '')
+    sector = filters.get('sector', None)
+    sub_sector = filters.get('sub_sector', None)
     
     results = search_stocks(
         text=text,
@@ -342,23 +347,7 @@ def search_stocks_endpoint():
         sub_sector=sub_sector
     )
     
-    # Convert results to JSON-serializable format
-    stocks_data = [
-        {
-            'stock_id': stock.stock_id,
-            'symbol': stock.symbol,
-            'company': stock.company,
-            'sector': stock.sector,
-            'sub_sector': stock.sub_sector,
-            'country': stock.country,
-            'price': float(stock.price),
-            'quantity': stock.quantity,
-            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
-        }
-        for stock in results
-    ]
-    
-    return jsonify(stocks_data), 200
+    return jsonify(_stocks_to_json(results)), 200
 
 @routes_bp.route('/stockbyscore', methods=['GET'])
 def stock_by_score():
@@ -446,6 +435,7 @@ def _stocks_to_json(stocks):
             'country': stock.country,
             'price': float(stock.price),
             'quantity': stock.quantity,
+<<<<<<< HEAD
             'last_updated': stock.last_updated.isoformat() if stock.last_updated else None,
             'change': change_abs,
             'change_pct': change_pct,
@@ -453,6 +443,12 @@ def _stocks_to_json(stocks):
 =======
         })
     return result
+=======
+            'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
+        }
+        for stock in stocks
+        )   
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
 
 @routes_bp.route('/stocks/<symbol>', methods=['GET'])
 def get_stock_by_symbol(symbol):
@@ -640,6 +636,7 @@ def populate_market_data(symbol):
 #  ACCOUNT ROUTES
 # =========================
 
+<<<<<<< HEAD
 @routes_bp.route('/account/<int:user_id>', methods=['GET'])
 @jwt_required()
 def get_account_by_user_id(user_id):
@@ -663,6 +660,8 @@ def get_account_by_user_id(user_id):
     }), 200
 
 
+=======
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
 @routes_bp.route('/accounts', methods=['GET'])
 @jwt_required()
 def get_user_account():
@@ -737,6 +736,7 @@ def update_account():
 #  HOLDING ROUTES
 # =========================
 
+<<<<<<< HEAD
 @routes_bp.route('/holdings/<int:user_id>', methods=['GET'])
 @jwt_required()
 def get_holdings_by_user_id(user_id):
@@ -769,6 +769,8 @@ def get_holdings_by_user_id(user_id):
     return jsonify(holdings_data), 200
 
 
+=======
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
 @routes_bp.route('/holdings', methods=['GET'])
 @jwt_required()
 def get_user_holdings():
@@ -793,9 +795,76 @@ def get_user_holdings():
             'stock_price': float(stock.price) if stock.price else None,
             'quantity': holding.quantity,
             'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
+<<<<<<< HEAD
 >>>>>>> Stashed changes
+=======
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
         })
-    return result
+    
+    return jsonify(holdings_data), 200
+
+
+@routes_bp.route('/holdings', methods=['POST'])
+@jwt_required()
+def create_or_update_holding():
+    """Create or update a holding for the authenticated user"""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    stock_id = data.get('stock_id')
+    quantity = data.get('quantity', 0)
+    
+    if not stock_id:
+        return jsonify({'error': 'stock_id is required'}), 400
+    
+    # Check if stock exists
+    stock = Stock.query.get(stock_id)
+    if not stock:
+        return jsonify({'error': 'Stock not found'}), 404
+    
+    # Check if holding already exists
+    holding = Holding.query.filter_by(user_id=user_id, stock_id=stock_id).first()
+    
+    if holding:
+        # Update existing holding
+        holding.quantity = quantity
+        message = 'Holding updated successfully'
+    else:
+        # Create new holding
+        holding = Holding(
+            user_id=user_id,
+            stock_id=stock_id,
+            quantity=quantity
+        )
+        db.session.add(holding)
+        message = 'Holding created successfully'
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': message,
+        'holding_id': holding.holding_id,
+        'user_id': holding.user_id,
+        'stock_id': holding.stock_id,
+        'quantity': holding.quantity
+    }), 201
+
+
+@routes_bp.route('/holdings/<int:holding_id>', methods=['DELETE'])
+@jwt_required()
+def delete_holding(holding_id):
+    """Delete a specific holding for the authenticated user"""
+    user_id = get_jwt_identity()
+    holding = Holding.query.filter_by(holding_id=holding_id, user_id=user_id).first()
+    
+    if not holding:
+        return jsonify({'error': 'Holding not found'}), 404
+    
+    db.session.delete(holding)
+    db.session.commit()
+    
+    return jsonify({'message': 'Holding deleted successfully'}), 200
+        
 
 def _get_growth_map(stock_ids):
     if not stock_ids:

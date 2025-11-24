@@ -1,5 +1,5 @@
 from .extensions import db, bcrypt
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Enum
 
 # =========================
@@ -15,15 +15,21 @@ class User(db.Model):
 <<<<<<< Updated upstream
     balance = db.Column('Balance', db.Numeric(15, 2), default=0.00)
     risk_averse = db.Column('RiskAverse', Enum('yes', 'no', name='risk_averse_enum'), nullable=False, default='no')
+<<<<<<< HEAD
     registered_at = db.Column('RegisteredAt', db.DateTime, default=datetime.utcnow)
 =======
     risk_averse = db.Column('RiskAverse', db.String(3), nullable=False, default='no')
     registered_at = db.Column('RegisteredAt', db.DateTime, default=lambda: datetime.now(timezone.utc))
 >>>>>>> Stashed changes
+=======
+    registered_at = db.Column('RegisteredAt', db.DateTime, default=lambda: datetime.now(timezone.utc))
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
     
     # Relationships
     logs = db.relationship('Log', backref='user', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('Transaction', backref='user', lazy=True, cascade='all, delete-orphan')
+    account = db.relationship('Account', backref='user', uselist=False, lazy=True, cascade='all, delete-orphan')
+    holdings = db.relationship('Holding', backref='user', lazy=True, cascade='all, delete-orphan')
 
     def set_password(self, password):
         """Hash and set the user's password"""
@@ -51,11 +57,12 @@ class Stock(db.Model):
     country = db.Column('Country', db.String(100))
     price = db.Column('Price', db.Numeric(15, 2), nullable=False)
     quantity = db.Column('Quantity', db.BigInteger, default=0)
-    last_updated = db.Column('LastUpdated', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_updated = db.Column('LastUpdated', db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     # Relationships
     scores = db.relationship('Score', backref='stock', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('Transaction', backref='stock', lazy=True, cascade='all, delete-orphan')
+    holdings = db.relationship('Holding', backref='stock', lazy=True, cascade='all, delete-orphan')
 
     def __repr__(self):
         return f'<Stock {self.symbol} - {self.company}>'
@@ -88,7 +95,7 @@ class Log(db.Model):
     user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False)
     action_type = db.Column('ActionType', Enum('login', 'logout', 'change', name='action_type_enum'), nullable=False)
     details = db.Column('Details', db.Text)
-    date_log = db.Column('DateLog', db.DateTime, default=datetime.utcnow)
+    date_log = db.Column('DateLog', db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     def __repr__(self):
         return f'<Log {self.log_id} - {self.action_type}>'
@@ -106,12 +113,15 @@ class Transaction(db.Model):
     transaction_type = db.Column('TransactionType', Enum('buy', 'sell', name='transaction_type_enum'), nullable=False)
     quantity_transac = db.Column('QuantityTransac', db.BigInteger, nullable=False)
     price_transac = db.Column('PriceTransac', db.Numeric(15, 2), nullable=False)
-    date_transac = db.Column('DateTransac', db.DateTime, default=datetime.utcnow)
+    date_transac = db.Column('DateTransac', db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     def __repr__(self):
         return f'<Transaction {self.transaction_id} - {self.transaction_type}>'
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 =======
+=======
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
 
 
 # =========================
@@ -153,7 +163,11 @@ class Account(db.Model):
     
     account_id = db.Column('AccountID', db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), unique=True, nullable=False)
+<<<<<<< HEAD
     balance = db.Column('Balance', db.Numeric(15, 2), default=10000.00, nullable=False)
+=======
+    balance = db.Column('Balance', db.Numeric(15, 2), default=0.00, nullable=False)
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
     created_at = db.Column('CreatedAt', db.DateTime, default=datetime.utcnow)
     updated_at = db.Column('UpdatedAt', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -175,4 +189,7 @@ class Holding(db.Model):
 
     def __repr__(self):
         return f'<Holding {self.holding_id} - User {self.user_id} Stock {self.stock_id}>'
+<<<<<<< HEAD
 >>>>>>> Stashed changes
+=======
+>>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
