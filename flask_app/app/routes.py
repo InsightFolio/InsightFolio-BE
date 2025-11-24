@@ -26,9 +26,23 @@ def login():
     data = request.get_json()
     user = User.query.filter_by(username=data['username']).first() or User.query.filter_by(email=data['username']).first()
     if user and user.check_password(data['password']):
-        token = create_access_token(identity=str(user.user_id))  
+        token = create_access_token(identity=str(user.user_id))
         return jsonify({'token': token}), 200
     return jsonify({'error': 'Invalid credentials'}), 401
+
+
+@routes_bp.route('/score', methods=['POST'])
+def score():
+    payload = request.get_json(silent=True) or {}
+    overrides = payload.get('config') if isinstance(payload, dict) else {}
+    config: QlibConfig = load_config_from_env(overrides)
+
+    try:
+        response = run_scoring_workflow(config)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        return jsonify({'error': str(exc)}), 500
+
+    return jsonify(response), 200
 
 @routes_bp.route('/users', methods=['POST'])
 def create_or_update_user():
@@ -928,3 +942,4 @@ def delete_holding(holding_id):
     db.session.commit()
     
     return jsonify({'message': 'Holding deleted successfully'}), 200
+
