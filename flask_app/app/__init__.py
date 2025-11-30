@@ -6,8 +6,13 @@ import os
 from pathlib import Path
 
 
-def create_app() -> Flask:
-    """Create and configure the Flask application."""
+def create_app(register_routes: bool = True) -> Flask:
+    """
+    Create and configure the Flask application.
+
+    Args:
+        register_routes: Whether to register the main blueprint (set False for offline scripts).
+    """
     load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
     app = Flask(__name__)
@@ -19,7 +24,7 @@ def create_app() -> Flask:
     bcrypt.init_app(app)
     jwt.init_app(app)
 
-    from .routes import routes_bp
-    app.register_blueprint(routes_bp)
+    if register_routes:
+        from .routes import routes_bp
+        app.register_blueprint(routes_bp)
     return app
-
