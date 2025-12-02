@@ -12,18 +12,8 @@ class User(db.Model):
     username = db.Column('Username', db.String(50), nullable=False)
     email = db.Column('Email', db.String(100), unique=True, nullable=False)
     password = db.Column('Password', db.String(255), nullable=False)
-<<<<<<< Updated upstream
-    balance = db.Column('Balance', db.Numeric(15, 2), default=0.00)
-    risk_averse = db.Column('RiskAverse', Enum('yes', 'no', name='risk_averse_enum'), nullable=False, default='no')
-<<<<<<< HEAD
-    registered_at = db.Column('RegisteredAt', db.DateTime, default=datetime.utcnow)
-=======
     risk_averse = db.Column('RiskAverse', db.String(3), nullable=False, default='no')
     registered_at = db.Column('RegisteredAt', db.DateTime, default=lambda: datetime.now(timezone.utc))
->>>>>>> Stashed changes
-=======
-    registered_at = db.Column('RegisteredAt', db.DateTime, default=lambda: datetime.now(timezone.utc))
->>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
     
     # Relationships
     logs = db.relationship('Log', backref='user', lazy=True, cascade='all, delete-orphan')
@@ -117,11 +107,6 @@ class Transaction(db.Model):
 
     def __repr__(self):
         return f'<Transaction {self.transaction_id} - {self.transaction_type}>'
-<<<<<<< HEAD
-<<<<<<< Updated upstream
-=======
-=======
->>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
 
 
 # =========================
@@ -163,11 +148,7 @@ class Account(db.Model):
     
     account_id = db.Column('AccountID', db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), unique=True, nullable=False)
-<<<<<<< HEAD
     balance = db.Column('Balance', db.Numeric(15, 2), default=10000.00, nullable=False)
-=======
-    balance = db.Column('Balance', db.Numeric(15, 2), default=0.00, nullable=False)
->>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
     created_at = db.Column('CreatedAt', db.DateTime, default=datetime.utcnow)
     updated_at = db.Column('UpdatedAt', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -189,7 +170,3 @@ class Holding(db.Model):
 
     def __repr__(self):
         return f'<Holding {self.holding_id} - User {self.user_id} Stock {self.stock_id}>'
-<<<<<<< HEAD
->>>>>>> Stashed changes
-=======
->>>>>>> 20fa7bb758e07599f19f3b95e1ff2f09edf632ae
