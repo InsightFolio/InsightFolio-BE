@@ -17,19 +17,45 @@ def signup():
     data = request.get_json()
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already registered'}), 400
+    
     user = User(username=data['username'], email=data['email'])
     user.set_password(data['password'])
     db.session.add(user)
+    db.session.flush()  # Get user_id before creating account
+    
+    # Auto-create account with default balance
+    from decimal import Decimal
+    account = Account(user_id=user.user_id, balance=Decimal('10000.00'))
+    db.session.add(account)
     db.session.commit()
+    
     return jsonify({'message': 'User created successfully'}), 201
 
 @routes_bp.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
-    user = User.query.filter_by(username=data['username']).first() or User.query.filter_by(email=data['username']).first()
+    username_or_email = data.get('username')
+    
+    # Query for user by username OR email
+    user = User.query.filter(
+        db.or_(User.username == username_or_email, User.email == username_or_email)
+    ).first()
+    
     if user and user.check_password(data['password']):
         token = create_access_token(identity=str(user.user_id))
-        return jsonify({'token': token}), 200
+        
+        # Get account balance
+        account = Account.query.filter_by(user_id=user.user_id).first()
+        
+        return jsonify({
+            'token': token,
+            'user': {
+                'user_id': user.user_id,
+                'username': user.username,
+                'email': user.email,
+                'balance': float(account.balance) if account else 0.00
+            }
+        }), 200
     return jsonify({'error': 'Invalid credentials'}), 401
 
 
@@ -144,9 +170,14 @@ def execute_transaction():
         }), 201
         
     except ValueError as e:
+        db.session.rollback()
+        print(f"ValueError: {str(e)}")
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         db.session.rollback()
+        import traceback
+        print(f"Exception: {str(e)}")
+        traceback.print_exc()
         return jsonify({'error': f'Transaction failed: {str(e)}'}), 500
 
 
@@ -634,7 +665,29 @@ def get_user_account():
         return jsonify({'error': 'Account not found'}), 404
     
     return jsonify({
-        'account_id': account.account_id,
+        'user_id': account.user_id,
+        'balance': float(account.balance),
+        'created_at': account.created_at.isoformat() if account.created_at else None,
+        'updated_at': account.updated_at.isoformat() if account.updated_at else None
+    }), 200
+
+
+@routes_bp.route('/account/<int:user_id>', methods=['GET'])
+@jwt_required()
+def get_account_by_user_id(user_id):
+    """Get account by user_id (with authorization check)"""
+    requesting_user_id = int(get_jwt_identity())
+    
+    # Authorization: user can only access their own account
+    if requesting_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    account = Account.query.filter_by(user_id=user_id).first()
+    
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
+    
+    return jsonify({
         'user_id': account.user_id,
         'balance': float(account.balance),
         'created_at': account.created_at.isoformat() if account.created_at else None,
@@ -663,7 +716,6 @@ def create_account():
     
     return jsonify({
         'message': 'Account created successfully',
-        'account_id': account.account_id,
         'user_id': account.user_id,
         'balance': float(account.balance)
     }), 201
@@ -687,7 +739,7 @@ def update_account():
     
     return jsonify({
         'message': 'Account updated successfully',
-        'account_id': account.account_id,
+        'user_id': account.user_id,
         'balance': float(account.balance),
         'updated_at': account.updated_at.isoformat() if account.updated_at else None
     }), 200
@@ -702,6 +754,39 @@ def update_account():
 def get_user_holdings():
     """Get all holdings for the authenticated user, sorted alphabetically by stock symbol"""
     user_id = get_jwt_identity()
+    
+    # Query holdings with joined stock data, filter by user_id, sort by stock symbol
+    holdings = db.session.query(Holding, Stock)\
+        .join(Stock, Holding.stock_id == Stock.stock_id)\
+        .filter(Holding.user_id == user_id)\
+        .order_by(Stock.symbol)\
+        .all()
+    
+    holdings_data = []
+    for holding, stock in holdings:
+        holdings_data.append({
+            'holding_id': holding.holding_id,
+            'user_id': holding.user_id,
+            'stock_id': holding.stock_id,
+            'stock_symbol': stock.symbol,
+            'stock_company': stock.company,
+            'stock_price': float(stock.price) if stock.price else None,
+            'quantity': holding.quantity,
+            'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
+        })
+    
+    return jsonify(holdings_data), 200
+
+
+@routes_bp.route('/holdings/<int:user_id>', methods=['GET'])
+@jwt_required()
+def get_holdings_by_user_id(user_id):
+    """Get holdings by user_id (with authorization check)"""
+    requesting_user_id = int(get_jwt_identity())
+    
+    # Authorization: user can only access their own holdings
+    if requesting_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
     
     # Query holdings with joined stock data, filter by user_id, sort by stock symbol
     holdings = db.session.query(Holding, Stock)\

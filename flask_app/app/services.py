@@ -87,8 +87,8 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
     if not stock.price or stock.price <= 0:
         raise ValueError(f"Stock {stock.symbol} does not have a valid price")
     
-    price = stock.price
-    total_cost = Decimal(str(price)) * qty
+    price = Decimal(str(stock.price))
+    total_cost = price * Decimal(qty)
     
     # Get or create account
     account = db.session.execute(
@@ -97,6 +97,10 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
     
     if not account:
         raise ValueError("Account not found. Please create an account first.")
+    
+    # Ensure balance is Decimal (handle legacy float values)
+    if not isinstance(account.balance, Decimal):
+        account.balance = Decimal(str(account.balance))
     
     # Validate and update based on transaction type
     if txn_type == 'buy':
