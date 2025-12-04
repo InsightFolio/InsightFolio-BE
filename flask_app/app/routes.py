@@ -1,16 +1,168 @@
-from flask import Blueprint, request, jsonify, current_app
-from sqlalchemy import select, func
-from . import db, jwt
-from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo
-from .seed import seed_database
-import yfinance as yf
+import os
 from datetime import datetime, timezone
+
+import yfinance as yf
+from flask import Blueprint, jsonify, current_app, request
+from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
+from pymongo import MongoClient
+from sqlalchemy import func, select
+
+# Prefer absolute import when app is run from repo root; fall back to local module when running inside flask_app.
+try:
+    from flask_app import load_stocks
+except ImportError:  # pragma: no cover - runtime safety
+    import load_stocks  # type: ignore
+
+from . import db, jwt
+from .models import Account, Holding, MarketData, Score, Stock, Transaction, User
 from .scoring import QlibConfig, load_config_from_env, run_scoring_workflow
+from .seed import seed_database
+from .services import (
+    add_transaction,
+    create_market_data_from_yahoo,
+    process_transaction,
+    search_stocks,
+    upsert_user,
+)
 
 
 routes_bp = Blueprint('routes', __name__)
+
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "marketdb")
+try:
+    _mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) if MONGO_URI else None
+    _mongo_db = _mongo_client[MONGO_DB_NAME] if _mongo_client else None
+    _mongo_stocks_col = _mongo_db["stocks"] if _mongo_db else None
+    _mongo_market_data_col = _mongo_db["marketData"] if _mongo_db else None
+except Exception:
+    _mongo_client = None
+    _mongo_db = None
+    _mongo_stocks_col = None
+    _mongo_market_data_col = None
+
+
+def _first_present(data, *keys, default=None):
+    """Return the first present key from the payload or the provided default."""
+    for key in keys:
+        if key in data:
+            return data[key]
+    return default
+
+
+def _required(data, *keys, type_=None):
+    """
+    Fetch a required field, supporting multiple aliases.
+    Raises ValueError when missing or of the wrong type.
+    """
+    sentinel = object()
+    value = _first_present(data, *keys, default=sentinel)
+    if value is sentinel:
+        raise ValueError(f"Missing required field: '{keys[0]}'")
+    if type_ is not None and not isinstance(value, type_):
+        if type_ is float and isinstance(value, int):
+            value = float(value)
+        else:
+            raise ValueError(f"Field '{keys[0]}' must be of type {type_.__name__}")
+    return value
+
+
+def parse_iso_datetime(value, field_name):
+    """
+    Accepts ISO 8601 strings or datetime objects and normalizes to UTC-aware datetimes.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        normalized = value.replace("Z", "+00:00").replace(" ", "T")
+        try:
+            dt = datetime.fromisoformat(normalized)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(value, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    raise ValueError(f"Invalid datetime format for {field_name}: {value!r}")
+
+
+def _wants_mongo(payload: dict) -> bool:
+    backend = (request.args.get("backend") or "").lower()
+    if backend == "mongo":
+        return True
+    return bool(payload.get("use_mongo") or payload.get("useMongo"))
+
+
+def _sync_db_to_mongo(stock_db_url: str, market_db_url: str) -> dict:
+    """
+    Copy stocks and market_data from SQL databases into MongoDB collections.
+    Stock metadata is read from stock_db_url (remote prod), while market data
+    is read from market_db_url (local backfilled SQLite).
+    """
+    if _mongo_stocks_col is None or _mongo_market_data_col is None:
+        raise RuntimeError("MongoDB not configured; set MONGO_URI")
+
+    synced_stocks = 0
+    synced_market_data = 0
+
+    with load_stocks._session_scope(stock_db_url) as session:
+        stock_rows = session.execute(select(Stock)).scalars().all()
+        for stock in stock_rows:
+            doc = {
+                "_id": stock.symbol,
+                "stockId": stock.stock_id,
+                "company": stock.company,
+                "sector": stock.sector,
+                "subSector": stock.sub_sector,
+                "country": stock.country,
+                "price": float(stock.price) if stock.price is not None else None,
+                "quantity": int(stock.quantity) if stock.quantity is not None else None,
+                "lastUpdated": stock.last_updated,
+            }
+            _mongo_stocks_col.update_one({"_id": stock.symbol}, {"$set": doc}, upsert=True)
+        synced_stocks = len(stock_rows)
+
+    with load_stocks._session_scope(market_db_url) as session:
+        market_rows = session.execute(select(MarketData)).scalars().all()
+        for md in market_rows:
+            doc = {
+                "instrument": md.instrument,
+                "dateTime": md.datetime,
+                "open": float(md.open) if md.open is not None else None,
+                "high": float(md.high) if md.high is not None else None,
+                "low": float(md.low) if md.low is not None else None,
+                "close": float(md.close) if md.close is not None else None,
+                "volume": int(md.volume) if md.volume is not None else None,
+                "vwap": float(md.vwap) if md.vwap is not None else None,
+                "amount": float(md.amount) if md.amount is not None else None,
+                "factor": float(md.factor) if md.factor is not None else None,
+                "turnover": float(md.turnover) if md.turnover is not None else None,
+                "floatShares": int(md.float_shares) if md.float_shares is not None else None,
+                "createdAt": md.created_at,
+            }
+            _mongo_market_data_col.update_one(
+                {"instrument": md.instrument, "dateTime": md.datetime},
+                {"$set": doc},
+                upsert=True,
+            )
+        synced_market_data = len(market_rows)
+
+    return {
+        "stocks_synced": synced_stocks,
+        "market_data_synced": synced_market_data,
+        "backend": "mongo",
+        "stock_db": stock_db_url,
+        "market_db": market_db_url,
+    }
+
+
+@routes_bp.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
 
 @routes_bp.route('/signup', methods=['POST'])
 def signup():
@@ -65,18 +217,122 @@ def create_or_update_user():
 
 @routes_bp.route('/stocks', methods=['POST'])
 def create_or_update_stock():
-    data = request.get_json()
-    s = upsert_stock(
-        symbol=data["symbol"],
-        company=data["company"],
-        sector=data.get("sector"),
-        sub_sector=data.get("sub_sector"),
-        country=data.get("country"),
-        price=data.get("price", 0.0),
-        quantity=data.get("quantity", 0),
-    )
-    db.session.commit()
-    return jsonify({"stock_id": s.stock_id}), 201
+    """
+    Create or update a stock record using the posted JSON payload.
+
+    Accepts both camelCase and snake_case keys for compatibility:
+    {
+      "symbol": "A",
+      "stockId": 1,                       (optional)
+      "company": "Agilent Technologies Inc.",
+      "sector": "Healthcare",
+      "subSector": "Diagnostics & Research",
+      "country": "United States",
+      "price": 151.25,
+      "quantity": 283500427,
+      "lastUpdated": "2025-11-23T20:33:04Z"  (optional, defaults to now)
+      "use_mongo": true                     (optional; or ?backend=mongo)
+    }
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        symbol = _required(payload, "symbol", type_=str).upper()
+        company = _required(payload, "company", type_=str)
+        sector = _first_present(payload, "sector")
+        sub_sector = _first_present(payload, "subSector", "sub_sector")
+        country = _first_present(payload, "country")
+        price = float(_required(payload, "price"))
+        quantity = int(_required(payload, "quantity"))
+        last_updated_raw = _first_present(payload, "lastUpdated", "last_updated")
+        stock_id_value = _first_present(payload, "stockId", "stock_id")
+        last_updated = (
+            parse_iso_datetime(last_updated_raw, "lastUpdated")
+            if last_updated_raw is not None
+            else datetime.now(timezone.utc)
+        )
+
+        if _wants_mongo(payload):
+            if _mongo_stocks_col is None:
+                return jsonify({"ok": False, "error": "MongoDB not configured; set MONGO_URI"}), 400
+
+            doc = {
+                "_id": symbol,
+                "company": company,
+                "sector": sector,
+                "subSector": sub_sector,
+                "country": country,
+                "price": price,
+                "quantity": quantity,
+                "lastUpdated": last_updated,
+            }
+            if stock_id_value is not None:
+                doc["stockId"] = stock_id_value
+
+            result = _mongo_stocks_col.update_one(
+                {"_id": symbol},
+                {"$set": doc},
+                upsert=True,
+            )
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "backend": "mongo",
+                    "symbol": symbol,
+                    "upserted_id": str(result.upserted_id) if result.upserted_id else None,
+                    "matched_count": result.matched_count,
+                    "modified_count": result.modified_count,
+                }
+            ), 201 if result.upserted_id else 200
+
+        stock = None
+        if stock_id_value is not None:
+            try:
+                stock_id_int = int(stock_id_value)
+            except (TypeError, ValueError):
+                raise ValueError("Field 'stockId' must be an integer")
+            stock = db.session.get(Stock, stock_id_int)
+            if stock is None:
+                raise ValueError(f"Stock with ID {stock_id_int} not found")
+
+        if stock is None:
+            stock = db.session.execute(
+                select(Stock).where(Stock.symbol == symbol)
+            ).scalar_one_or_none()
+
+        created = False
+        if stock is None:
+            stock = Stock(symbol=symbol)
+            db.session.add(stock)
+            created = True
+
+        stock.company = company
+        stock.sector = sector
+        stock.sub_sector = sub_sector
+        stock.country = country
+        stock.price = price
+        stock.quantity = quantity
+        stock.last_updated = last_updated
+
+        db.session.commit()
+
+        return jsonify(
+            {
+                "ok": True,
+                "stock_id": stock.stock_id,
+                "symbol": stock.symbol,
+                "created": created,
+                "last_updated": stock.last_updated.isoformat() if stock.last_updated else None,
+            }
+        ), 201 if created else 200
+
+    except ValueError as exc:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:  # pragma: no cover - defensive guard
+        db.session.rollback()
+        current_app.logger.exception("Stock create/update failed")
+        return jsonify({"ok": False, "error": f"Server error: {exc}"}), 500
 
 @routes_bp.route('/transactions', methods=['POST'])
 def create_transaction():
@@ -499,6 +755,140 @@ def get_yahoo_finance_data(symbol):
             'details': str(e)
         }), 404
 
+
+@routes_bp.route('/market-data', methods=['POST'])
+def create_market_data():
+    """
+    Create or update a market data record.
+
+    Expected JSON body (camelCase or snake_case):
+    {
+      "instrument": "AAPL",
+      "dateTime": "2025-11-23T20:59:20Z",
+      "open": 144.47,
+      "high": 151.76,
+      "low": 144.47,
+      "close": 151.25,
+      "vwap": 149.16,
+      "volume": 2468420,
+      "amount": 368189527.20,
+      "factor": 1.398,
+      "turnover": 0.008737,
+      "floatShares": 282519516,
+      "createdAt": "2025-11-23T21:00:15Z"
+    }
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        instrument = _required(payload, "instrument", type_=str).upper()
+        date_time = parse_iso_datetime(_required(payload, "dateTime", "datetime"), "dateTime")
+
+        open_ = float(_required(payload, "open"))
+        high = float(_required(payload, "high"))
+        low = float(_required(payload, "low"))
+        close = float(_required(payload, "close"))
+        vwap_raw = _first_present(payload, "vwap")
+        vwap = float(vwap_raw) if vwap_raw is not None else None
+
+        volume = int(_required(payload, "volume"))
+        amount_raw = _first_present(payload, "amount")
+        amount = float(amount_raw) if amount_raw is not None else None
+        factor_raw = _first_present(payload, "factor")
+        factor = float(factor_raw) if factor_raw is not None else None
+        turnover_raw = _first_present(payload, "turnover")
+        turnover = float(turnover_raw) if turnover_raw is not None else None
+        float_shares_raw = _first_present(payload, "floatShares", "float_shares")
+        float_shares = int(float_shares_raw) if float_shares_raw is not None else None
+
+        created_at_raw = _first_present(payload, "createdAt", "created_at")
+        created_at = (
+            parse_iso_datetime(created_at_raw, "createdAt")
+            if created_at_raw is not None
+            else datetime.now(timezone.utc)
+        )
+
+        if _wants_mongo(payload):
+            if _mongo_market_data_col is None:
+                return jsonify({"ok": False, "error": "MongoDB not configured; set MONGO_URI"}), 400
+
+            doc = {
+                "instrument": instrument,
+                "dateTime": date_time,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "vwap": vwap,
+                "volume": volume,
+                "amount": amount,
+                "factor": factor,
+                "turnover": turnover,
+                "floatShares": float_shares,
+                "createdAt": created_at,
+            }
+
+            result = _mongo_market_data_col.update_one(
+                {"instrument": instrument, "dateTime": date_time},
+                {"$set": doc},
+                upsert=True,
+            )
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "backend": "mongo",
+                    "instrument": instrument,
+                    "upserted_id": str(result.upserted_id) if result.upserted_id else None,
+                    "matched_count": result.matched_count,
+                    "modified_count": result.modified_count,
+                }
+            ), 201 if result.upserted_id else 200
+
+        market_data = db.session.execute(
+            select(MarketData).where(
+                MarketData.instrument == instrument,
+                MarketData.datetime == date_time
+            )
+        ).scalar_one_or_none()
+
+        created = False
+        if market_data is None:
+            market_data = MarketData(instrument=instrument, datetime=date_time)
+            db.session.add(market_data)
+            created = True
+
+        market_data.open = open_
+        market_data.high = high
+        market_data.low = low
+        market_data.close = close
+        market_data.volume = volume
+        market_data.vwap = vwap
+        market_data.amount = amount
+        market_data.factor = factor
+        market_data.turnover = turnover
+        market_data.float_shares = float_shares
+        market_data.created_at = created_at
+
+        db.session.commit()
+
+        return jsonify(
+            {
+                "ok": True,
+                "id": market_data.id,
+                "instrument": market_data.instrument,
+                "created": created,
+            }
+        ), 201 if created else 200
+
+    except ValueError as exc:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:  # pragma: no cover - defensive guard
+        db.session.rollback()
+        current_app.logger.exception("Market data insert failed")
+        return jsonify({"ok": False, "error": f"Server error: {exc}"}), 500
+
+
 @routes_bp.route('/market-data/<symbol>', methods=['GET'])
 def get_market_data(symbol):
     """
@@ -598,10 +988,89 @@ def populate_market_data(symbol):
         }), 500
 
 
+@routes_bp.route('/load-stocks', methods=['POST'])
+def load_stocks_endpoint():
+    """
+    Backfill local market_data from Yahoo Finance using symbols in the remote DB,
+    then rebuild the Qlib dataset.
+    After completion, optionally sync the resulting stocks/market_data into MongoDB.
+    """
+    payload = request.get_json(silent=True) or {}
 
-# =========================
-#  ACCOUNT ROUTES
-# =========================
+    source_db_url = payload.get("source_database_url") or os.getenv("DATABASE_URL")
+    target_db_url = payload.get("target_database_url") or load_stocks.DEFAULT_SQLITE_URL
+    provider_uri = payload.get("provider_uri") or os.getenv("QLIB_DATA_PATH")
+    region = payload.get("region") or os.getenv("QLIB_REGION")
+    cache_dir = payload.get("cache_dir") or os.getenv("QLIB_CACHE_DIR")
+    skip_clean = bool(payload.get("skip_clean", False))
+    try:
+        days = int(payload.get("days", 365))
+    except (TypeError, ValueError):
+        days = 365
+
+    if not source_db_url:
+        return jsonify({"error": "source_database_url is required or set DATABASE_URL"}), 400
+
+    try:
+        result = load_stocks.sync_remote_symbols_to_local(
+            source_database_url=source_db_url,
+            target_database_url=target_db_url,
+            days=days,
+            provider_uri=provider_uri,
+            region=region,
+            cache_dir=cache_dir,
+            skip_clean=skip_clean,
+        )
+        # After the local sync finishes, push the data into MongoDB if configured.
+        if _mongo_stocks_col and _mongo_market_data_col:
+            try:
+                mongo_sync = _sync_db_to_mongo(source_db_url, target_db_url)
+                result["mongo_sync"] = mongo_sync
+            except Exception as exc:  # pragma: no cover - defensive guard
+                current_app.logger.exception("Mongo sync after load-stocks failed")
+                result["mongo_sync"] = {"error": str(exc)}
+
+        return jsonify(result), 200
+    except Exception as exc:  # pragma: no cover - defensive guard
+        current_app.logger.exception("Load stocks endpoint failed")
+        message = str(exc) or f"{exc.__class__.__name__} occurred"
+        return jsonify({"error": message}), 500
+
+
+@routes_bp.route('/sync-mongo', methods=['POST'])
+def sync_mongo_endpoint():
+    """
+    Upsert stocks and market_data from SQL databases into MongoDB without backfilling.
+
+    Request body (optional):
+    {
+      "source_database_url": "...",   # SQL DB for stocks (defaults to env DATABASE_URL)
+      "market_database_url": "...",   # SQL DB for market_data (defaults to local SQLite)
+      "target_database_url": "..."    # alias for market_database_url
+    }
+    """
+    payload = request.get_json(silent=True) or {}
+
+    stock_db_url = payload.get("source_database_url") or os.getenv("DATABASE_URL")
+    market_db_url = (
+        payload.get("market_database_url")
+        or payload.get("target_database_url")
+        or load_stocks.DEFAULT_SQLITE_URL
+    )
+
+    if not stock_db_url:
+        return jsonify({"error": "source_database_url is required or set DATABASE_URL"}), 400
+    if _mongo_stocks_col is None or _mongo_market_data_col is None:
+        return jsonify({"error": "MongoDB not configured; set MONGO_URI"}), 400
+
+    try:
+        result = _sync_db_to_mongo(stock_db_url, market_db_url)
+        return jsonify(result), 200
+    except Exception as exc:  # pragma: no cover - defensive guard
+        current_app.logger.exception("Mongo sync endpoint failed")
+        message = str(exc) or f"{exc.__class__.__name__} occurred"
+        return jsonify({"error": message}), 500
+
 
 def _get_growth_map(stock_ids):
     if not stock_ids:

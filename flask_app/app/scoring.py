@@ -1,6 +1,6 @@
 import os
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -45,6 +45,22 @@ def _parse_symbols(raw_symbols: Optional[Union[str, List[str]]]) -> List[str]:
     if isinstance(raw_symbols, str):
         return [symbol.strip() for symbol in raw_symbols.split(",") if symbol.strip()]
     return raw_symbols
+
+
+def _normalize_dates(config: QlibConfig) -> tuple[datetime.date, datetime.date, datetime.date]:
+    start = pd.to_datetime(config.start_date).date()
+    end = pd.to_datetime(config.end_date).date()
+    train_end = pd.to_datetime(config.train_end_date).date()
+
+    if end < start:
+        raise ValueError("QLIB_END_DATE must be on or after QLIB_START_DATE.")
+
+    # Keep the train/valid split inside the available window.
+    train_end = min(train_end, end)
+    if train_end < start:
+        train_end = start
+
+    return start, end, train_end
 
 
 def load_config_from_env(overrides: Optional[Dict[str, Any]] = None) -> QlibConfig:
@@ -107,18 +123,25 @@ def build_dataset(config: QlibConfig, symbols: List[str]) -> DatasetH:
     Build an Alpha158-based dataset over your chosen instruments.
     Assumes your provider has at least OHLCV (which you do).
     """
+    start_dt, end_dt, train_end_dt = _normalize_dates(config)
+    start_str, end_str, train_end_str = (
+        start_dt.isoformat(),
+        end_dt.isoformat(),
+        train_end_dt.isoformat(),
+    )
+
     handler = Alpha158(
         instruments=symbols,
-        start_time=config.start_date,
-        end_time=config.end_date,
-        fit_start_time=config.start_date,
-        fit_end_time=config.train_end_date,
+        start_time=start_str,
+        end_time=end_str,
+        fit_start_time=start_str,
+        fit_end_time=train_end_str,
     )
 
     segments = {
-        "train": (config.start_date, config.train_end_date),
-        "valid": (config.train_end_date, config.end_date),
-        "test": (config.train_end_date, config.end_date),
+        "train": (start_str, train_end_str),
+        "valid": (train_end_str, end_str),
+        "test": (train_end_str, end_str),
     }
     return DatasetH(handler=handler, segments=segments)
 
@@ -160,7 +183,14 @@ def format_scores(
     scores: List[Dict[str, Union[str, float]]] = []
     for index, score in _extract_predictions(predictions):
         if isinstance(index, tuple) and len(index) >= 2:
-            symbol, timestamp = index[0], index[1]
+            first, second = index[0], index[1]
+            # Qlib sometimes returns (timestamp, symbol) instead of (symbol, timestamp).
+            if isinstance(first, (pd.Timestamp, datetime)):
+                timestamp, symbol = first, second
+            elif isinstance(second, (pd.Timestamp, datetime)):
+                symbol, timestamp = first, second
+            else:
+                symbol, timestamp = first, second
         else:
             symbol, timestamp = index, datetime.utcnow()
         scores.append(
