@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import select, func
 from . import db, jwt
 from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
+from .mongo_models import Stock as MongoStock, MarketData as MongoMarketData
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo
 from .seed import seed_database
@@ -44,8 +45,15 @@ def login():
     if user and user.check_password(data['password']):
         token = create_access_token(identity=str(user.user_id))
         
-        # Get account balance
+        # Calculate total holdings value
         account = Account.query.filter_by(user_id=user.user_id).first()
+        holdings = Holding.query.filter(Holding.user_id == user.user_id).all()
+        total_holdings_value = 0.0
+        
+        for holding in holdings:
+            stock = MongoStock.objects(stock_id=holding.stock_id).first()
+            if stock and stock.price:
+                total_holdings_value += float(stock.price) * holding.quantity
         
         return jsonify({
             'token': token,
@@ -53,7 +61,7 @@ def login():
                 'user_id': user.user_id,
                 'username': user.username,
                 'email': user.email,
-                'balance': float(account.balance) if account else 0.00
+                'balance': total_holdings_value  # Total value of holdings
             }
         }), 200
     return jsonify({'error': 'Invalid credentials'}), 401
@@ -188,21 +196,23 @@ def get_user_transactions():
     """Get all transactions for the authenticated user, sorted by date (newest first)"""
     user_id = get_jwt_identity()
     
-    # Query transactions with joined stock data, filter by user_id, sort by date descending
-    transactions = db.session.query(Transaction, Stock)\
-        .join(Stock, Transaction.stock_id == Stock.stock_id)\
+    # Query transactions from MySQL
+    transactions = Transaction.query\
         .filter(Transaction.user_id == user_id)\
         .order_by(Transaction.date_transac.desc())\
         .all()
     
     transactions_data = []
-    for transaction, stock in transactions:
+    for transaction in transactions:
+        # Fetch stock data from MongoDB
+        stock = MongoStock.objects(stock_id=transaction.stock_id).first()
+        
         transactions_data.append({
             'transaction_id': transaction.transaction_id,
             'user_id': transaction.user_id,
             'stock_id': transaction.stock_id,
-            'stock_symbol': stock.symbol,
-            'stock_company': stock.company,
+            'stock_symbol': stock.symbol if stock else None,
+            'stock_company': stock.company if stock else None,
             'transaction_type': transaction.transaction_type,
             'quantity': transaction.quantity_transac,
             'price': float(transaction.price_transac),
@@ -226,7 +236,8 @@ def get_transaction(transaction_id):
     if not transaction:
         return jsonify({'error': 'Transaction not found'}), 404
     
-    stock = Stock.query.get(transaction.stock_id)
+    # Fetch stock data from MongoDB
+    stock = MongoStock.objects(stock_id=transaction.stock_id).first()
     
     return jsonify({
         'transaction_id': transaction.transaction_id,
@@ -657,16 +668,26 @@ def _get_growth_map(stock_ids):
 @routes_bp.route('/accounts', methods=['GET'])
 @jwt_required()
 def get_user_account():
-    """Get the account for the authenticated user"""
+    """Get the account for the authenticated user with total holdings value"""
     user_id = get_jwt_identity()
     account = Account.query.filter_by(user_id=user_id).first()
     
     if not account:
         return jsonify({'error': 'Account not found'}), 404
     
+    # Calculate total holdings value from MongoDB stock prices
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
+    total_holdings_value = 0.0
+    
+    for holding in holdings:
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        if stock and stock.price:
+            total_holdings_value += float(stock.price) * holding.quantity
+    
     return jsonify({
         'user_id': account.user_id,
-        'balance': float(account.balance),
+        'balance': total_holdings_value,  # Total value of holdings
+        'account_balance': float(account.balance),  # Account balance (cash)
         'created_at': account.created_at.isoformat() if account.created_at else None,
         'updated_at': account.updated_at.isoformat() if account.updated_at else None
     }), 200
@@ -687,9 +708,19 @@ def get_account_by_user_id(user_id):
     if not account:
         return jsonify({'error': 'Account not found'}), 404
     
+    # Calculate total holdings value from MongoDB stock prices
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
+    total_holdings_value = 0.0
+    
+    for holding in holdings:
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        if stock and stock.price:
+            total_holdings_value += float(stock.price) * holding.quantity
+    
     return jsonify({
         'user_id': account.user_id,
-        'balance': float(account.balance),
+        'balance': total_holdings_value,  # Total value of holdings
+        'account_balance': float(account.balance),  # Account balance (cash)
         'created_at': account.created_at.isoformat() if account.created_at else None,
         'updated_at': account.updated_at.isoformat() if account.updated_at else None
     }), 200
@@ -755,25 +786,27 @@ def get_user_holdings():
     """Get all holdings for the authenticated user, sorted alphabetically by stock symbol"""
     user_id = get_jwt_identity()
     
-    # Query holdings with joined stock data, filter by user_id, sort by stock symbol
-    holdings = db.session.query(Holding, Stock)\
-        .join(Stock, Holding.stock_id == Stock.stock_id)\
-        .filter(Holding.user_id == user_id)\
-        .order_by(Stock.symbol)\
-        .all()
+    # Query holdings from MySQL
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
     
     holdings_data = []
-    for holding, stock in holdings:
+    for holding in holdings:
+        # Fetch stock data from MongoDB
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        
         holdings_data.append({
             'holding_id': holding.holding_id,
             'user_id': holding.user_id,
             'stock_id': holding.stock_id,
-            'stock_symbol': stock.symbol,
-            'stock_company': stock.company,
-            'stock_price': float(stock.price) if stock.price else None,
+            'stock_symbol': stock.symbol if stock else None,
+            'stock_company': stock.company if stock else None,
+            'stock_price': float(stock.price) if stock and stock.price else None,
             'quantity': holding.quantity,
             'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
         })
+    
+    # Sort by stock symbol
+    holdings_data.sort(key=lambda x: x['stock_symbol'] or '')
     
     return jsonify(holdings_data), 200
 
@@ -788,25 +821,27 @@ def get_holdings_by_user_id(user_id):
     if requesting_user_id != user_id:
         return jsonify({'error': 'Unauthorized'}), 403
     
-    # Query holdings with joined stock data, filter by user_id, sort by stock symbol
-    holdings = db.session.query(Holding, Stock)\
-        .join(Stock, Holding.stock_id == Stock.stock_id)\
-        .filter(Holding.user_id == user_id)\
-        .order_by(Stock.symbol)\
-        .all()
+    # Query holdings from MySQL
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
     
     holdings_data = []
-    for holding, stock in holdings:
+    for holding in holdings:
+        # Fetch stock data from MongoDB
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        
         holdings_data.append({
             'holding_id': holding.holding_id,
             'user_id': holding.user_id,
             'stock_id': holding.stock_id,
-            'stock_symbol': stock.symbol,
-            'stock_company': stock.company,
-            'stock_price': float(stock.price) if stock.price else None,
+            'stock_symbol': stock.symbol if stock else None,
+            'stock_company': stock.company if stock else None,
+            'stock_price': float(stock.price) if stock and stock.price else None,
             'quantity': holding.quantity,
             'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
         })
+    
+    # Sort by stock symbol
+    holdings_data.sort(key=lambda x: x['stock_symbol'] or '')
     
     return jsonify(holdings_data), 200
 
@@ -824,8 +859,8 @@ def create_or_update_holding():
     if not stock_id:
         return jsonify({'error': 'stock_id is required'}), 400
     
-    # Check if stock exists
-    stock = Stock.query.get(stock_id)
+    # Check if stock exists in MongoDB
+    stock = MongoStock.objects(stock_id=stock_id).first()
     if not stock:
         return jsonify({'error': 'Stock not found'}), 404
     
