@@ -684,13 +684,18 @@ def get_user_account():
         if stock and stock.price:
             total_holdings_value += float(stock.price) * holding.quantity
     
-    return jsonify({
+    response = jsonify({
         'user_id': account.user_id,
         'balance': total_holdings_value,  # Total value of holdings
         'account_balance': float(account.balance),  # Account balance (cash)
         'created_at': account.created_at.isoformat() if account.created_at else None,
         'updated_at': account.updated_at.isoformat() if account.updated_at else None
-    }), 200
+    })
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
 
 
 @routes_bp.route('/account/<int:user_id>', methods=['GET'])
@@ -717,13 +722,18 @@ def get_account_by_user_id(user_id):
         if stock and stock.price:
             total_holdings_value += float(stock.price) * holding.quantity
     
-    return jsonify({
+    response = jsonify({
         'user_id': account.user_id,
         'balance': total_holdings_value,  # Total value of holdings
         'account_balance': float(account.balance),  # Account balance (cash)
         'created_at': account.created_at.isoformat() if account.created_at else None,
         'updated_at': account.updated_at.isoformat() if account.updated_at else None
-    }), 200
+    })
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
 
 
 @routes_bp.route('/portfolio/history/<int:user_id>', methods=['GET'])
@@ -738,7 +748,12 @@ def get_portfolio_history(user_id):
     
     try:
         history = calculate_portfolio_history(user_id)
-        return jsonify(history), 200
+        response = jsonify(history)
+        # Prevent caching to ensure fresh data after transactions
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response, 200
     except Exception as e:
         return jsonify({'error': f'Failed to calculate portfolio history: {str(e)}'}), 500
 
@@ -842,7 +857,12 @@ def get_user_holdings():
     # Sort by stock symbol
     holdings_data.sort(key=lambda x: x['stock_symbol'] or '')
     
-    return jsonify(holdings_data), 200
+    response = jsonify(holdings_data)
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
 
 
 @routes_bp.route('/holdings/<int:user_id>', methods=['GET'])
@@ -894,7 +914,12 @@ def get_holdings_by_user_id(user_id):
     # Sort by stock symbol
     holdings_data.sort(key=lambda x: x['stock_symbol'] or '')
     
-    return jsonify(holdings_data), 200
+    response = jsonify(holdings_data)
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
 
 
 @routes_bp.route('/holdings', methods=['POST'])
