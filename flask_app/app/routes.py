@@ -45,15 +45,32 @@ def login():
     if user and user.check_password(data['password']):
         token = create_access_token(identity=str(user.user_id))
         
-        # Calculate total holdings value
+        # Get account balance
         account = Account.query.filter_by(user_id=user.user_id).first()
+        
+        # Calculate total holdings value (using MySQL Stock table as fallback)
         holdings = Holding.query.filter(Holding.user_id == user.user_id).all()
         total_holdings_value = 0.0
         
         for holding in holdings:
-            stock = MongoStock.objects(stock_id=holding.stock_id).first()
-            if stock and stock.price:
-                total_holdings_value += float(stock.price) * holding.quantity
+            stock_price = None
+            
+            # Try MongoDB first
+            try:
+                mongo_stock = MongoStock.objects(stock_id=holding.stock_id).first()
+                if mongo_stock and mongo_stock.price:
+                    stock_price = float(mongo_stock.price)
+            except Exception:
+                pass  # MongoDB failed, will try MySQL below
+            
+            # Fallback to MySQL if MongoDB didn't return a price
+            if stock_price is None:
+                sql_stock = Stock.query.get(holding.stock_id)
+                if sql_stock and sql_stock.price:
+                    stock_price = float(sql_stock.price)
+            
+            if stock_price:
+                total_holdings_value += stock_price * holding.quantity
         
         return jsonify({
             'token': token,
@@ -61,7 +78,8 @@ def login():
                 'user_id': user.user_id,
                 'username': user.username,
                 'email': user.email,
-                'balance': total_holdings_value  # Total value of holdings
+                'balance': float(account.balance) if account else 0.00,
+                'holdings_value': total_holdings_value
             }
         }), 200
     return jsonify({'error': 'Invalid credentials'}), 401
@@ -497,6 +515,30 @@ def get_stock_by_symbol(symbol):
         'quantity': stock.quantity,
         'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
     }), 200
+
+
+@routes_bp.route('/stocks/all/symbols', methods=['GET'])
+def get_all_stock_symbols():
+    """
+    Get all stock symbols and company names from the database.
+    
+    GET /stocks/all/symbols
+    
+    Returns:
+    [
+        {"symbol": "AAPL", "company": "Apple Inc."},
+        {"symbol": "MSFT", "company": "Microsoft Corporation"},
+        ...
+    ]
+    """
+    stocks = db.session.execute(
+        select(Stock.symbol, Stock.company).order_by(Stock.symbol)
+    ).all()
+    
+    return jsonify([
+        {'symbol': symbol, 'company': company}
+        for symbol, company in stocks
+    ]), 200
 
 @routes_bp.route('/yahoo/<symbol>', methods=['GET'])
 def get_yahoo_finance_data(symbol):

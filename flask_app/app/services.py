@@ -175,30 +175,54 @@ def search_stocks(text: str, country=None, min_price: float = 0, max_price: floa
     
     Args:
         text: Search text for symbol or company name
-        country: Single country string, list of countries, or None
+        country: Single country string, comma-separated string, list of countries, or None
         min_price: Minimum price filter
         max_price: Maximum price filter
-        sector: Single sector string, list of sectors, or None
-        sub_sector: Single sub_sector string, list of sub_sectors, or None
+        sector: Single sector string, comma-separated string, list of sectors, or None
+        sub_sector: Single sub_sector string, comma-separated string, list of sub_sectors, or None
     """
+    
+    # Helper function to normalize filter values (handles comma-separated strings)
+    def normalize_filter(value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return [v.strip() for v in value if v.strip()] if value else None
+        if isinstance(value, str) and value:
+            # Split comma-separated string into list
+            parts = [v.strip() for v in value.split(',') if v.strip()]
+            return parts if parts else None
+        return None
+    
+    # Normalize all filter values
+    country_list = normalize_filter(country)
+    sector_list = normalize_filter(sector)
+    sub_sector_list = normalize_filter(sub_sector)
+    
     query = select(Stock)
     
-    # Search text in Symbol or Company (case-insensitive)
+    # Search text 
     if text:
         search_pattern = f"%{text}%"
+        starts_pattern = f"{text}%"
         query = query.where(
             db.or_(
                 Stock.symbol.ilike(search_pattern),
                 Stock.company.ilike(search_pattern)
             )
+        ).order_by(
+            # Prioritize: symbol starts with > company starts with > others
+            db.case(
+                (Stock.symbol.ilike(starts_pattern), 1),
+                (Stock.company.ilike(starts_pattern), 2),
+                else_=3
+            ),
+            Stock.symbol  # Then alphabetically
         )
     
-    # Apply country filter - handles both single value and list
-    if country:
-        if isinstance(country, list) and len(country) > 0:
-            query = query.where(Stock.country.in_(country))
-        elif isinstance(country, str) and country:
-            query = query.where(Stock.country == country)
+    # Apply country filter
+    if country_list:
+        query = query.where(Stock.country.in_(country_list))
     
     # Apply price range filter if both min and max are not 0
     if min_price > 0 or max_price > 0:
@@ -207,22 +231,16 @@ def search_stocks(text: str, country=None, min_price: float = 0, max_price: floa
         if max_price > 0:
             query = query.where(Stock.price <= max_price)
     
-    # Apply sector filter - handles both single value and list
-    if sector:
-        if isinstance(sector, list) and len(sector) > 0:
-            query = query.where(Stock.sector.in_(sector))
-        elif isinstance(sector, str) and sector:
-            query = query.where(Stock.sector == sector)
+    # Apply sector filter
+    if sector_list:
+        query = query.where(Stock.sector.in_(sector_list))
     
-    # Apply sub_sector filter - handles both single value and list
-    if sub_sector:
-        if isinstance(sub_sector, list) and len(sub_sector) > 0:
-            query = query.where(Stock.sub_sector.in_(sub_sector))
-        elif isinstance(sub_sector, str) and sub_sector:
-            query = query.where(Stock.sub_sector == sub_sector)
+    # Apply sub_sector filter
+    if sub_sector_list:
+        query = query.where(Stock.sub_sector.in_(sub_sector_list))
     
-    # Limit to 10 results
-    query = query.limit(10)
+    # Limit to 50 results
+    query = query.limit(50)
     
     results = db.session.execute(query).scalars().all()
     return results
