@@ -2,10 +2,14 @@ import os
 from datetime import datetime, timezone
 
 import yfinance as yf
+from pymongo import UpdateOne
 from flask import Blueprint, jsonify, current_app, request
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
 from pymongo import MongoClient
 from sqlalchemy import func, select
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine
+from contextlib import contextmanager
 
 # Prefer absolute import when app is run from repo root; fall back to local module when running inside flask_app.
 try:
@@ -96,7 +100,33 @@ def _wants_mongo(payload: dict) -> bool:
     return bool(payload.get("use_mongo") or payload.get("useMongo"))
 
 
-def _sync_db_to_mongo(stock_db_url: str, market_db_url: str) -> dict:
+@contextmanager
+def _session_scope_for_sync(database_url: str):
+    """
+    Light-weight session scope with short connect timeout for remote DBs.
+    """
+    engine_kwargs = {"pool_pre_ping": True}
+    if database_url.startswith("mysql"):
+        engine_kwargs["connect_args"] = {"connect_timeout": 5}
+    engine = create_engine(database_url, **engine_kwargs)
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def _sync_db_to_mongo(
+    stock_db_url: str,
+    market_db_url: str,
+    symbols: list[str] | None = None,
+    limit_market: int | None = None,
+    skip_stocks: bool = False,
+    skip_market: bool = False,
+    since: datetime | None = None,
+) -> dict:
     """
     Copy stocks and market_data from SQL databases into MongoDB collections.
     Stock metadata is read from stock_db_url (remote prod), while market data
@@ -107,48 +137,77 @@ def _sync_db_to_mongo(stock_db_url: str, market_db_url: str) -> dict:
 
     synced_stocks = 0
     synced_market_data = 0
+    symbol_filter = {s.upper() for s in symbols} if symbols else None
 
-    with load_stocks._session_scope(stock_db_url) as session:
-        stock_rows = session.execute(select(Stock)).scalars().all()
-        for stock in stock_rows:
-            doc = {
-                "_id": stock.symbol,
-                "stockId": stock.stock_id,
-                "company": stock.company,
-                "sector": stock.sector,
-                "subSector": stock.sub_sector,
-                "country": stock.country,
-                "price": float(stock.price) if stock.price is not None else None,
-                "quantity": int(stock.quantity) if stock.quantity is not None else None,
-                "lastUpdated": stock.last_updated,
-            }
-            _mongo_stocks_col.update_one({"_id": stock.symbol}, {"$set": doc}, upsert=True)
-        synced_stocks = len(stock_rows)
+    if not skip_stocks:
+        with _session_scope_for_sync(stock_db_url) as session:
+            stock_query = select(Stock).execution_options(stream_results=True)
+            if symbol_filter:
+                stock_query = stock_query.where(Stock.symbol.in_(symbol_filter))
+            stock_stream = session.execute(stock_query).scalars().yield_per(500)
 
-    with load_stocks._session_scope(market_db_url) as session:
-        market_rows = session.execute(select(MarketData)).scalars().all()
-        for md in market_rows:
-            doc = {
-                "instrument": md.instrument,
-                "dateTime": md.datetime,
-                "open": float(md.open) if md.open is not None else None,
-                "high": float(md.high) if md.high is not None else None,
-                "low": float(md.low) if md.low is not None else None,
-                "close": float(md.close) if md.close is not None else None,
-                "volume": int(md.volume) if md.volume is not None else None,
-                "vwap": float(md.vwap) if md.vwap is not None else None,
-                "amount": float(md.amount) if md.amount is not None else None,
-                "factor": float(md.factor) if md.factor is not None else None,
-                "turnover": float(md.turnover) if md.turnover is not None else None,
-                "floatShares": int(md.float_shares) if md.float_shares is not None else None,
-                "createdAt": md.created_at,
-            }
-            _mongo_market_data_col.update_one(
-                {"instrument": md.instrument, "dateTime": md.datetime},
-                {"$set": doc},
-                upsert=True,
-            )
-        synced_market_data = len(market_rows)
+            stock_ops: list[UpdateOne] = []
+            for stock in stock_stream:
+                doc = {
+                    "_id": stock.symbol,
+                    "stockId": stock.stock_id,
+                    "company": stock.company,
+                    "sector": stock.sector,
+                    "subSector": stock.sub_sector,
+                    "country": stock.country,
+                    "price": float(stock.price) if stock.price is not None else None,
+                    "quantity": int(stock.quantity) if stock.quantity is not None else None,
+                    "lastUpdated": stock.last_updated,
+                }
+                stock_ops.append(UpdateOne({"_id": stock.symbol}, {"$set": doc}, upsert=True))
+                synced_stocks += 1
+                if len(stock_ops) >= 500:
+                    _mongo_stocks_col.bulk_write(stock_ops, ordered=False)
+                    stock_ops.clear()
+            if stock_ops:
+                _mongo_stocks_col.bulk_write(stock_ops, ordered=False)
+
+    if not skip_market:
+        with _session_scope_for_sync(market_db_url) as session:
+            market_query = select(MarketData).execution_options(stream_results=True)
+            if symbol_filter:
+                market_query = market_query.where(MarketData.instrument.in_(symbol_filter))
+            if since is not None:
+                market_query = market_query.where(MarketData.datetime >= since)
+            market_stream = session.execute(market_query).scalars().yield_per(1000)
+
+            market_ops: list[UpdateOne] = []
+            for md in market_stream:
+                doc = {
+                    "instrument": md.instrument,
+                    "dateTime": md.datetime,
+                    "open": float(md.open) if md.open is not None else None,
+                    "high": float(md.high) if md.high is not None else None,
+                    "low": float(md.low) if md.low is not None else None,
+                    "close": float(md.close) if md.close is not None else None,
+                    "volume": int(md.volume) if md.volume is not None else None,
+                    "vwap": float(md.vwap) if md.vwap is not None else None,
+                    "amount": float(md.amount) if md.amount is not None else None,
+                    "factor": float(md.factor) if md.factor is not None else None,
+                    "turnover": float(md.turnover) if md.turnover is not None else None,
+                    "floatShares": int(md.float_shares) if md.float_shares is not None else None,
+                    "createdAt": md.created_at,
+                }
+                market_ops.append(
+                    UpdateOne(
+                        {"instrument": md.instrument, "dateTime": md.datetime},
+                        {"$set": doc},
+                        upsert=True,
+                    )
+                )
+                synced_market_data += 1
+                if limit_market is not None and synced_market_data >= limit_market:
+                    break
+                if len(market_ops) >= 500:
+                    _mongo_market_data_col.bulk_write(market_ops, ordered=False)
+                    market_ops.clear()
+            if market_ops:
+                _mongo_market_data_col.bulk_write(market_ops, ordered=False)
 
     return {
         "stocks_synced": synced_stocks,
@@ -156,7 +215,57 @@ def _sync_db_to_mongo(stock_db_url: str, market_db_url: str) -> dict:
         "backend": "mongo",
         "stock_db": stock_db_url,
         "market_db": market_db_url,
+        "symbols_filtered": sorted(symbol_filter) if symbol_filter else None,
+        "limit_market": limit_market,
+        "skip_stocks": skip_stocks,
+        "skip_market": skip_market,
+        "since": since.isoformat() if since else None,
     }
+
+
+def _dedupe_market_data(symbols: list[str] | None = None) -> dict:
+    """
+    Remove duplicate marketData docs that share the same (instrument, dateTime).
+    Keeps one document per pair and deletes the rest.
+    """
+    if _mongo_market_data_col is None:
+        return {"duplicate_groups": 0, "deleted": 0, "backend": "mongo"}
+
+    match_stage = None
+    if symbols:
+        match_stage = {"instrument": {"$in": [s.upper() for s in symbols]}}
+
+    pipeline = []
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+    pipeline.extend(
+        [
+            {
+                "$group": {
+                    "_id": {"instrument": "$instrument", "dateTime": "$dateTime"},
+                    "ids": {"$addToSet": "$_id"},
+                    "count": {"$sum": 1},
+                }
+            },
+            {"$match": {"count": {"$gt": 1}}},
+        ]
+    )
+
+    duplicate_groups = 0
+    deleted = 0
+    cursor = _mongo_market_data_col.aggregate(pipeline, allowDiskUse=True)
+    for group in cursor:
+        ids = group.get("ids") or []
+        if not ids:
+            continue
+        duplicate_groups += 1
+        keeper = ids[0]
+        to_delete = [i for i in ids if i != keeper]
+        if to_delete:
+            res = _mongo_market_data_col.delete_many({"_id": {"$in": to_delete}})
+            deleted += res.deleted_count
+
+    return {"duplicate_groups": duplicate_groups, "deleted": deleted, "backend": "mongo"}
 
 
 @routes_bp.route("/health", methods=["GET"])
@@ -1046,7 +1155,13 @@ def sync_mongo_endpoint():
     {
       "source_database_url": "...",   # SQL DB for stocks (defaults to env DATABASE_URL)
       "market_database_url": "...",   # SQL DB for market_data (defaults to local SQLite)
-      "target_database_url": "..."    # alias for market_database_url
+      "target_database_url": "...",   # alias for market_database_url
+      "symbols": ["AAPL", "MSFT"],    # optional symbol filter
+      "limit_market": 5000,           # optional cap on market_data rows processed
+      "skip_stocks": false,
+      "skip_market": false,
+      "since": "2025-01-01T00:00:00Z",# optional datetime filter for market_data
+      "dry_run": true                 # optional: parse/validate only
     }
     """
     payload = request.get_json(silent=True) or {}
@@ -1057,6 +1172,17 @@ def sync_mongo_endpoint():
         or payload.get("target_database_url")
         or load_stocks.DEFAULT_SQLITE_URL
     )
+    symbols = payload.get("symbols")
+    limit_market = payload.get("limit_market")
+    skip_stocks = bool(payload.get("skip_stocks", False))
+    skip_market = bool(payload.get("skip_market", False))
+    since_raw = payload.get("since")
+    since = None
+    if since_raw:
+        try:
+            since = parse_iso_datetime(since_raw, "since")
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
     if not stock_db_url:
         return jsonify({"error": "source_database_url is required or set DATABASE_URL"}), 400
@@ -1064,7 +1190,53 @@ def sync_mongo_endpoint():
         return jsonify({"error": "MongoDB not configured; set MONGO_URI"}), 400
 
     try:
-        result = _sync_db_to_mongo(stock_db_url, market_db_url)
+        limit_market_int = int(limit_market) if limit_market is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit_market must be an integer"}), 400
+
+    if payload.get("dry_run"):
+        return jsonify(
+            {
+                "ok": True,
+                "dry_run": True,
+                "stock_db_url": stock_db_url,
+                "market_db_url": market_db_url,
+                "symbols": symbols,
+                "limit_market": limit_market_int,
+                "skip_stocks": skip_stocks,
+                "skip_market": skip_market,
+                "since": since.isoformat() if since else None,
+            }
+        ), 200
+
+    try:
+        current_app.logger.info(
+            "Starting sync-mongo",
+            extra={
+                "stock_db_url": stock_db_url,
+                "market_db_url": market_db_url,
+                "symbols": symbols,
+                "limit_market": limit_market_int,
+                "skip_stocks": skip_stocks,
+                "skip_market": skip_market,
+                "since": since.isoformat() if since else None,
+            },
+        )
+        result = _sync_db_to_mongo(
+            stock_db_url=stock_db_url,
+            market_db_url=market_db_url,
+            symbols=symbols,
+            limit_market=limit_market_int,
+            skip_stocks=skip_stocks,
+            skip_market=skip_market,
+            since=since,
+        )
+        try:
+            dedupe_result = _dedupe_market_data(symbols)
+            result["dedupe"] = dedupe_result
+        except Exception as dedupe_exc:  # pragma: no cover - defensive guard
+            current_app.logger.exception("Mongo dedupe failed")
+            result["dedupe"] = {"error": str(dedupe_exc)}
         return jsonify(result), 200
     except Exception as exc:  # pragma: no cover - defensive guard
         current_app.logger.exception("Mongo sync endpoint failed")
