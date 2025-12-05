@@ -487,6 +487,30 @@ def get_stock_by_symbol(symbol):
         'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
     }), 200
 
+
+@routes_bp.route('/stocks/all/symbols', methods=['GET'])
+def get_all_stock_symbols():
+    """
+    Get all stock symbols and company names from the database.
+    
+    GET /stocks/all/symbols
+    
+    Returns:
+    [
+        {"symbol": "AAPL", "company": "Apple Inc."},
+        {"symbol": "MSFT", "company": "Microsoft Corporation"},
+        ...
+    ]
+    """
+    stocks = db.session.execute(
+        select(Stock.symbol, Stock.company).order_by(Stock.symbol)
+    ).all()
+    
+    return jsonify([
+        {'symbol': symbol, 'company': company}
+        for symbol, company in stocks
+    ]), 200
+
 @routes_bp.route('/yahoo/<symbol>', methods=['GET'])
 def get_yahoo_finance_data(symbol):
     """
