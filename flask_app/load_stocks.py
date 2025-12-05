@@ -185,33 +185,48 @@ def load_all_symbols(start_dt: datetime, end_dt: datetime, session: Session | No
 
 
 def sync_remote_symbols_to_local(
-    source_database_url: str,
+    source_database_url: str | None,
     target_database_url: str = DEFAULT_SQLITE_URL,
     days: int = 365,
     provider_uri: str | Path | None = None,
     region: str | None = None,
     cache_dir: str | Path | None = None,
     skip_clean: bool = False,
+    symbols: list[str] | None = None,
 ) -> dict:
     """
-    Pull stock symbols from a remote DB, backfill market_data into a local DB, and rebuild Qlib data.
+    Pull stock symbols (either provided or from a remote DB), backfill market_data into a local DB,
+    and rebuild Qlib data.
     """
-    if not source_database_url:
-        raise ValueError("source_database_url is required")
-
-    source_database_url = str(source_database_url)
     target_database_url = str(target_database_url)
 
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=max(days, 1))
 
-    symbols = _fetch_stock_symbols(source_database_url)
-    if not symbols:
-        return {"symbols": [], "rows_inserted": 0, "dataset": None, "message": "No symbols found"}
+    symbols_list = symbols or []
+    symbols_list = sorted({s.upper() for s in symbols_list if s})
+
+    symbol_source = "provided"
+    if not symbols_list:
+        if not source_database_url:
+            raise ValueError("source_database_url is required when symbols are not provided")
+        source_database_url = str(source_database_url)
+        symbols_list = _fetch_stock_symbols(source_database_url)
+        symbol_source = "database"
+
+    if not symbols_list:
+        return {
+            "symbols": [],
+            "symbols_checked": 0,
+            "rows_inserted": 0,
+            "dataset": None,
+            "message": "No symbols found",
+            "symbol_source": symbol_source,
+        }
 
     with _session_scope(target_database_url) as session:
         _ensure_schema(session)
-        rows_inserted = load_symbols(symbols, start_dt, end_dt, session=session)
+        rows_inserted = load_symbols(symbols_list, start_dt, end_dt, session=session)
 
     dataset_info = build_dataset(
         provider_uri=provider_uri,
@@ -222,12 +237,13 @@ def sync_remote_symbols_to_local(
     )
 
     return {
-        "symbols": symbols,
-        "symbols_checked": len(symbols),
+        "symbols": symbols_list,
+        "symbols_checked": len(symbols_list),
         "rows_inserted": rows_inserted,
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
         "dataset": dataset_info,
+        "symbol_source": symbol_source,
     }
 
 

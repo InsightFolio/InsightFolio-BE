@@ -5,3 +5,5 @@ instance/
 .venv/
 .env
 venv/
+# Qlib generated data
+flask_app/qlib_data/

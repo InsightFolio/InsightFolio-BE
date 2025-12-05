@@ -1,15 +1,22 @@
 import os
+import time
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import pandas as pd
 import qlib
+from flask import current_app, has_app_context
 from qlib.config import REG_CN, REG_US
 from qlib.contrib.data.handler import Alpha158
 from qlib.contrib.model.gbdt import LGBModel
 from qlib.data import D
 from qlib.data.dataset import DatasetH
+from sqlalchemy import func
+
+from . import db
+from .models import MarketData
 
 
 @dataclass
@@ -28,9 +35,47 @@ class QlibConfig:
 class _QlibState:
     def __init__(self) -> None:
         self.initialized: bool = False
+        self.dataset_ready: bool = False
 
 
 _QLIB_STATE = _QlibState()
+
+
+def _provider_has_data(provider_uri: str, freq: str = "day") -> bool:
+    """
+    Light check to see if the provider directory looks populated.
+    """
+    base = Path(os.path.expanduser(provider_uri))
+    calendar = base / "calendars" / f"{freq}.txt"
+    instruments = base / "instruments" / "all.txt"
+    features_dir = base / "features"
+    if not calendar.exists() or not instruments.exists() or not features_dir.exists():
+        return False
+    return any(features_dir.rglob("*.bin"))
+
+
+def ensure_dataset_available(config: QlibConfig) -> None:
+    """
+    If the provider is empty, build a fresh dataset on the fly so scoring can run automatically.
+    """
+    if _QLIB_STATE.dataset_ready or _provider_has_data(config.provider_uri):
+        _QLIB_STATE.dataset_ready = True
+        return
+
+    try:
+        from flask_app import build_qlib_dataset as dataset_builder
+    except ImportError:  # pragma: no cover - runtime safety
+        import build_qlib_dataset as dataset_builder  # type: ignore
+
+    dataset_builder.build_dataset(
+        provider_uri=config.provider_uri,
+        freq="day",
+        region=config.region,
+        cache_dir=config.cache_dir,
+        skip_clean=False,
+        database_url=os.getenv("DATABASE_URL"),
+    )
+    _QLIB_STATE.dataset_ready = True
 
 
 def _parse_symbols(raw_symbols: Optional[Union[str, List[str]]]) -> List[str]:
@@ -66,21 +111,23 @@ def _normalize_dates(config: QlibConfig) -> tuple[datetime.date, datetime.date, 
 def load_config_from_env(overrides: Optional[Dict[str, Any]] = None) -> QlibConfig:
     overrides = overrides or {}
 
-    # 👇 default to your custom provider
-    provider_uri = overrides.get("provider_uri") or os.getenv(
-        "QLIB_DATA_PATH", os.path.expanduser("~/.qlib/qlib_data/my_data")
-    )
+    provider_uri = overrides.get("provider_uri") or "flask_app/qlib_data/my_data"
 
     # Region string; we map it to REG_CN / REG_US in ensure_qlib_initialized
-    region = (overrides.get("region") or os.getenv("QLIB_REGION", "US")).upper()
+    region = (overrides.get("region") or "US").upper()
 
     # Symbols must be present in your custom dataset ("A", "ABC", etc.)
     symbols = _parse_symbols(overrides.get("symbols") or os.getenv("QLIB_SYMBOLS"))
 
-    # Time window
-    start_date = overrides.get("start_date") or os.getenv("QLIB_START_DATE", "2024-01-01")
-    end_date = overrides.get("end_date") or os.getenv("QLIB_END_DATE", "2024-12-31")
-    train_end_date = overrides.get("train_end_date") or os.getenv("QLIB_TRAIN_END_DATE", "2024-10-31")
+    # Time window defaults derive from the DB when available.
+    db_dates = _date_defaults_from_db()
+    start_default, end_default, train_end_default = (
+        db_dates if db_dates else ("2024-01-01", "2024-12-31", "2024-10-31")
+    )
+
+    start_date = overrides.get("start_date") or start_default
+    end_date = overrides.get("end_date") or end_default
+    train_end_date = overrides.get("train_end_date") or train_end_default
 
     # Local cache for Qlib’s expression/dataset caches
     cache_dir = overrides.get("cache_dir") or os.getenv("QLIB_CACHE_DIR", "/tmp/qlib_cache")
@@ -96,6 +143,32 @@ def load_config_from_env(overrides: Optional[Dict[str, Any]] = None) -> QlibConf
     )
 
 
+def _date_defaults_from_db() -> Optional[Tuple[str, str, str]]:
+    """
+    Pull start/end/train_end defaults from the market_data table.
+    Returns ISO date strings or None when unavailable.
+    """
+    if not has_app_context():
+        return None
+    try:
+        min_dt, max_dt = db.session.query(
+            func.min(MarketData.datetime), func.max(MarketData.datetime)
+        ).one()
+    except Exception:
+        if current_app and current_app.logger:  # pragma: no cover - defensive guard
+            current_app.logger.exception("Failed to derive date defaults from market_data")
+        return None
+
+    if not min_dt or not max_dt:
+        return None
+
+    start_date = min_dt.date()
+    end_date = max_dt.date()
+    train_end_date = max(start_date, end_date - timedelta(days=20))
+
+    return start_date.isoformat(), end_date.isoformat(), train_end_date.isoformat()
+
+
 def ensure_qlib_initialized(config: QlibConfig) -> None:
     if _QLIB_STATE.initialized:
         return
@@ -108,12 +181,18 @@ def ensure_qlib_initialized(config: QlibConfig) -> None:
     os.makedirs(expression_cache, exist_ok=True)
     os.makedirs(dataset_cache, exist_ok=True)
 
+    _disable_qlib_recorder()
+
+    provider_uri_abs = str(Path(config.provider_uri).expanduser().resolve())
+    config.provider_uri = provider_uri_abs  # normalize so downstream uses an absolute path
+
     qlib.init(
-        provider_uri=os.path.expanduser(config.provider_uri),
+        provider_uri=provider_uri_abs,
         region=region_conf,
         redis_port=None,
         expression_cache_dir=expression_cache,
         dataset_cache_dir=dataset_cache,
+        custom_conf={"exp_manager": None},  # disable MLflow/recorder to avoid hangs
     )
     _QLIB_STATE.initialized = True
 
@@ -154,6 +233,11 @@ def train_model(dataset: DatasetH) -> LGBModel:
         raise RuntimeError(
             "LightGBM is not available. Install lightgbm (and libomp on macOS) to enable the scorer."
         ) from exc
+    # Suppress Qlib recorder metrics to avoid requiring R/C registration.
+    if hasattr(model, "log_metrics"):
+        model.log_metrics = lambda *args, **kwargs: None
+    if hasattr(model, "_log_metrics"):
+        model._log_metrics = lambda *args, **kwargs: None
     model.fit(dataset)
     return model
 
@@ -205,13 +289,35 @@ def format_scores(
 
 def run_scoring_workflow(config: Optional[QlibConfig] = None) -> Dict[str, Any]:
     config = config or load_config_from_env()
+    debug_log: list[str] = []
+    def log(msg: str) -> None:
+        debug_log.append(msg)
+        print(msg, flush=True)
+
+    log("run_scoring_workflow: ensure dataset")
+    ensure_dataset_available(config)
+    log("run_scoring_workflow: ensure qlib init")
     ensure_qlib_initialized(config)
     symbols = _resolve_symbols(config)
+    # Cap auto-discovered symbols to keep runs fast unless user explicitly requested symbols.
+    if not config.symbols and len(symbols) > 50:
+        log(f"run_scoring_workflow: trimming symbols from {len(symbols)} to 50 for speed")
+        symbols = symbols[:50]
+    log(f"run_scoring_workflow: symbols resolved ({len(symbols)})")
     dataset = build_dataset(config, symbols)
+    log("run_scoring_workflow: dataset built")
     model = train_model(dataset)
+    log("run_scoring_workflow: predicting on test segment")
+    predict_start = time.perf_counter()
     predictions = model.predict(dataset, segment="test")
-    results = format_scores(predictions)
-    return {"config": asdict(config), "results": results}
+    predict_ms = (time.perf_counter() - predict_start) * 1000
+    log(f"run_scoring_workflow: prediction finished in {predict_ms:.1f} ms; rows={_prediction_len(predictions)}")
+    # Trim extremely large prediction outputs to keep formatting fast.
+    predictions_trimmed = _trim_predictions(predictions, limit=1000, log=log)
+    log("run_scoring_workflow: formatting scores")
+    results = format_scores(predictions_trimmed)
+    log(f"run_scoring_workflow: formatted {len(results)} scores")
+    return {"config": asdict(config), "results": results, "log": debug_log}
 
 
 def _resolve_symbols(config: QlibConfig) -> List[str]:
@@ -221,16 +327,96 @@ def _resolve_symbols(config: QlibConfig) -> List[str]:
     if config.symbols:
         return config.symbols
 
-    instruments = D.list_instruments(
-        instruments="all",
-        start_time=config.start_date,
-        end_time=config.end_date,
-        freq=config.freq if hasattr(config, "freq") else "day",
-        as_list=True,
-    )
-    if not instruments:
-        raise ValueError(
-            "No instruments found in provider for the requested date range. "
-            "Ensure QLIB_DATA_PATH is correct and the date window matches your data."
+    instruments: List[str] | None = None
+    try:
+        instruments = D.list_instruments(
+            instruments="all",
+            start_time=config.start_date,
+            end_time=config.end_date,
+            freq=getattr(config, "freq", "day"),
+            as_list=True,
         )
-    return [str(instr) for instr in instruments]
+    except Exception as exc:
+        if current_app and current_app.logger:  # pragma: no cover - defensive guard
+            current_app.logger.exception("Failed to list instruments from provider", extra={"error": str(exc)})
+
+    if instruments:
+        return [str(instr) for instr in instruments]
+
+    fallback = _fallback_symbols_from_db(config)
+    if fallback:
+        return fallback
+
+    raise ValueError(
+        "No instruments found in provider or database for the requested date range. "
+        "Ensure the Qlib dataset exists or pass symbols explicitly."
+    )
+
+
+def _fallback_symbols_from_db(config: QlibConfig) -> List[str]:
+    """As a fallback, derive symbols from market_data within the requested window."""
+    if not has_app_context():
+        return []
+    try:
+        start_dt = pd.to_datetime(config.start_date)
+        end_dt = pd.to_datetime(config.end_date) + pd.Timedelta(days=1)
+        rows = (
+            db.session.query(MarketData.instrument)
+            .filter(MarketData.datetime >= start_dt, MarketData.datetime < end_dt)
+            .distinct()
+            .all()
+        )
+        return sorted({str(row[0]).upper() for row in rows if row and row[0]})
+    except Exception:
+        if current_app and current_app.logger:  # pragma: no cover - defensive guard
+            current_app.logger.exception("Fallback symbol discovery from DB failed")
+        return []
+
+
+def _disable_qlib_recorder() -> None:
+    """
+    Patch Qlib's recorder registration to a no-op to avoid MLflow hangs.
+    """
+    try:
+        from qlib.workflow import R
+        from qlib.config import C
+        import qlib.workflow.utils as wf_utils
+        C.register = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        R.register = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        R.end_exp = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        R.log_metrics = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        wf_utils.experiment_exit_handler = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _log_info(message: str) -> None:
+    if has_app_context() and current_app:
+        try:
+            current_app.logger.info(message)
+            return
+        except Exception:
+            pass
+    print(message, flush=True)
+
+
+def _prediction_len(predictions: Union[pd.Series, pd.DataFrame]) -> int:
+    if isinstance(predictions, pd.Series):
+        return len(predictions)
+    if isinstance(predictions, pd.DataFrame):
+        return len(predictions)
+    return 0
+
+
+def _trim_predictions(predictions: Union[pd.Series, pd.DataFrame], limit: int, log) -> Union[pd.Series, pd.DataFrame]:
+    """Limit prediction output size to avoid long formatting/serialization."""
+    try:
+        if isinstance(predictions, pd.Series) and len(predictions) > limit:
+            log(f"run_scoring_workflow: trimming predictions Series from {len(predictions)} to {limit}")
+            return predictions.head(limit)
+        if isinstance(predictions, pd.DataFrame) and len(predictions) > limit:
+            log(f"run_scoring_workflow: trimming predictions DataFrame from {len(predictions)} to {limit}")
+            return predictions.head(limit)
+    except Exception:
+        pass
+    return predictions

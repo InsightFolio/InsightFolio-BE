@@ -32,15 +32,36 @@ FIELD_MAP = {
 DEFAULT_FREQ = "day"
 
 
+def _disable_qlib_recorder() -> None:
+    """Patch Qlib's recorder registration to a no-op to avoid MLflow hangs."""
+    try:
+        from qlib.workflow import R
+        from qlib.config import C
+        import qlib.workflow.utils as wf_utils
+        C.register = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        R.register = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        R.end_exp = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        R.log_metrics = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+        wf_utils.experiment_exit_handler = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _init_qlib(provider_uri: Dict[str, str], region: str, cache_dir: Path | str) -> None:
     cache_dir = Path(cache_dir).expanduser()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # Avoid re-registering when QlibRecorder is already active.
+    from qlib.config import C
+    if getattr(C, "_registered", False):
+        return
+    _disable_qlib_recorder()
     qlib.init(
         provider_uri=provider_uri,
         region=REG_CN if region.upper() == "CN" else REG_US,
         redis_port=None,
         expression_cache_dir=str(cache_dir / "expression"),
         dataset_cache_dir=str(cache_dir / "dataset"),
+        custom_conf={"exp_manager": None},  # disable MLflow/recorder to avoid hangs
     )
 
 
