@@ -4,7 +4,7 @@ from . import db, jwt
 from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
 from .mongo_models import Stock as MongoStock, MarketData as MongoMarketData
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo
+from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo, calculate_portfolio_history
 from .seed import seed_database
 import yfinance as yf
 from datetime import datetime, timezone
@@ -726,6 +726,23 @@ def get_account_by_user_id(user_id):
     }), 200
 
 
+@routes_bp.route('/portfolio/history/<int:user_id>', methods=['GET'])
+@jwt_required()
+def get_portfolio_history(user_id):
+    """Get historical portfolio values from first transaction to today"""
+    requesting_user_id = int(get_jwt_identity())
+    
+    # Authorization: user can only access their own portfolio history
+    if requesting_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    try:
+        history = calculate_portfolio_history(user_id)
+        return jsonify(history), 200
+    except Exception as e:
+        return jsonify({'error': f'Failed to calculate portfolio history: {str(e)}'}), 500
+
+
 @routes_bp.route('/accounts', methods=['POST'])
 @jwt_required()
 def create_account():
@@ -794,14 +811,31 @@ def get_user_holdings():
         # Fetch stock data from MongoDB
         stock = MongoStock.objects(stock_id=holding.stock_id).first()
         
+        # Calculate average purchase price from transactions
+        transactions = Transaction.query.filter(
+            Transaction.user_id == user_id,
+            Transaction.stock_id == holding.stock_id,
+            Transaction.transaction_type == 'buy'
+        ).all()
+        
+        total_cost = sum(float(t.price_transac) * t.quantity_transac for t in transactions)
+        total_shares = sum(t.quantity_transac for t in transactions)
+        avg_purchase_price = total_cost / total_shares if total_shares > 0 else 0
+        
+        # Calculate growth percentage
+        current_price = float(stock.price) if stock and stock.price else 0
+        growth_percent = ((current_price - avg_purchase_price) / avg_purchase_price * 100) if avg_purchase_price > 0 else 0
+        
         holdings_data.append({
             'holding_id': holding.holding_id,
             'user_id': holding.user_id,
             'stock_id': holding.stock_id,
             'stock_symbol': stock.symbol if stock else None,
             'stock_company': stock.company if stock else None,
-            'stock_price': float(stock.price) if stock and stock.price else None,
+            'stock_price': current_price,
             'quantity': holding.quantity,
+            'purchase_price': round(avg_purchase_price, 2),
+            'growth_percent': round(growth_percent, 2),
             'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
         })
     
@@ -829,14 +863,31 @@ def get_holdings_by_user_id(user_id):
         # Fetch stock data from MongoDB
         stock = MongoStock.objects(stock_id=holding.stock_id).first()
         
+        # Calculate average purchase price from transactions
+        transactions = Transaction.query.filter(
+            Transaction.user_id == user_id,
+            Transaction.stock_id == holding.stock_id,
+            Transaction.transaction_type == 'buy'
+        ).all()
+        
+        total_cost = sum(float(t.price_transac) * t.quantity_transac for t in transactions)
+        total_shares = sum(t.quantity_transac for t in transactions)
+        avg_purchase_price = total_cost / total_shares if total_shares > 0 else 0
+        
+        # Calculate growth percentage
+        current_price = float(stock.price) if stock and stock.price else 0
+        growth_percent = ((current_price - avg_purchase_price) / avg_purchase_price * 100) if avg_purchase_price > 0 else 0
+        
         holdings_data.append({
             'holding_id': holding.holding_id,
             'user_id': holding.user_id,
             'stock_id': holding.stock_id,
             'stock_symbol': stock.symbol if stock else None,
             'stock_company': stock.company if stock else None,
-            'stock_price': float(stock.price) if stock and stock.price else None,
+            'stock_price': current_price,
             'quantity': holding.quantity,
+            'purchase_price': round(avg_purchase_price, 2),
+            'growth_percent': round(growth_percent, 2),
             'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
         })
     
