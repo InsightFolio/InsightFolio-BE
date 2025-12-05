@@ -17,7 +17,7 @@ def create_app(register_routes: bool = True) -> Flask:
     load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
     app = Flask(__name__)
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("SQLALCHEMY_DATABASE_URI")
     app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
     
     # Connect to MongoDB Atlas with database name
