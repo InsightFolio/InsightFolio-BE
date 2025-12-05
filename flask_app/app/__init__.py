@@ -1,31 +1,40 @@
 from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
-from flask_bcrypt import Bcrypt
-from flask_jwt_extended import JWTManager
+from .extensions import db, bcrypt, jwt
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from pathlib import Path
+from mongoengine import connect
 
-db = SQLAlchemy()
-bcrypt = Bcrypt()
-jwt = JWTManager()
 
-def create_app():
+def create_app(register_routes: bool = True) -> Flask:
+    """
+    Create and configure the Flask application.
+
+    Args:
+        register_routes: Whether to register the main blueprint (set False for offline scripts).
+    """
     load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
-    
-    app = Flask(__name__)
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
-    app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
 
-    print("Loaded DB URL:", app.config["SQLALCHEMY_DATABASE_URI"])  # optional debug. Remove this later. 
+    app = Flask(__name__)
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("SQLALCHEMY_DATABASE_URI")
+    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
+    
+    # Connect to MongoDB Atlas with database name
+    mongodb_uri = os.getenv("MONGODB_URL")
+    if mongodb_uri:
+        connect(db='marketdb', host=mongodb_uri)
 
     CORS(app)
     db.init_app(app)
     bcrypt.init_app(app)
     jwt.init_app(app)
 
-    from .routes import routes_bp
-    app.register_blueprint(routes_bp)
+    if register_routes:
+        from .routes import routes_bp
+        app.register_blueprint(routes_bp)
+    
+    from app.routes import cron_bp
+    app.register_blueprint(cron_bp)
 
     return app
