@@ -4,7 +4,8 @@ from decimal import Decimal
 from .models import User, Stock, Score, Log, Transaction, Account, Holding, MarketData
 from .mongo_models import Stock as MongoStock, MarketData as MongoMarketData
 import yfinance as yf
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
+from collections import defaultdict
 
 # USERS
 def upsert_user(username: str, email: str, password_plain: str, balance=0.0, risk_averse='no') -> User:
@@ -271,3 +272,130 @@ def create_market_data_from_yahoo(symbol: str) -> MarketData:
     )
     
     return market_data
+
+
+def calculate_portfolio_history(user_id: int):
+    """
+    Calculate daily portfolio value from first transaction to today.
+    
+    Args:
+        user_id: ID of the user
+    
+    Returns:
+        List of dicts with 'date' and 'value' keys, or empty list if no transactions
+    """
+    # Get all user transactions ordered by date
+    transactions = db.session.execute(
+        select(Transaction)
+        .where(Transaction.user_id == user_id)
+        .order_by(Transaction.date_transac)
+    ).scalars().all()
+    
+    if not transactions:
+        return []
+    
+    # Get date range
+    start_date = transactions[0].date_transac.date()
+    end_date = date.today()
+    
+    # Build a map of stock_id to symbol from MongoDB
+    stock_ids = set(t.stock_id for t in transactions)
+    stock_map = {}  # {stock_id: MongoStock}
+    
+    for stock_id in stock_ids:
+        stock = MongoStock.objects(stock_id=stock_id).first()
+        if stock:
+            stock_map[stock_id] = stock
+    
+    # Get historical prices from MongoDB MarketData
+    # Build a map of (symbol, date) -> price
+    price_map = {}  # {(symbol, date_str): price}
+    
+    for stock_id, stock in stock_map.items():
+        symbol = stock.symbol
+        # Query MarketData for this stock
+        # MongoDB stores datetime, we need to match by date
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        end_datetime = datetime.combine(end_date, datetime.max.time())
+        
+        market_data_records = MongoMarketData.objects(
+            instrument=symbol,
+            date_time__gte=start_datetime,
+            date_time__lte=end_datetime
+        ).only('date_time', 'close')
+        
+        for record in market_data_records:
+            record_date = record.date_time.date().isoformat()
+            price_map[(symbol, record_date)] = float(record.close)
+    
+    # Calculate portfolio value for each date
+    result = []
+    current_holdings = defaultdict(int)  # {stock_id: shares}
+    transaction_index = 0
+    
+    # Iterate through each date
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.isoformat()
+        
+        # Process all transactions on this date
+        while transaction_index < len(transactions):
+            txn = transactions[transaction_index]
+            txn_date = txn.date_transac.date()
+            
+            if txn_date > current_date:
+                break
+            
+            if txn_date == current_date:
+                # Update holdings based on transaction type
+                if txn.transaction_type.lower() == 'buy':
+                    current_holdings[txn.stock_id] += txn.quantity_transac
+                elif txn.transaction_type.lower() == 'sell':
+                    current_holdings[txn.stock_id] -= txn.quantity_transac
+                
+                transaction_index += 1
+            else:
+                transaction_index += 1
+        
+        # Calculate portfolio value for this date
+        portfolio_value = 0.0
+        
+        for stock_id, shares in current_holdings.items():
+            if shares <= 0:
+                continue
+            
+            stock = stock_map.get(stock_id)
+            if not stock:
+                continue
+            
+            symbol = stock.symbol
+            
+            # Try to get price for this date, fallback to previous dates
+            price = None
+            check_date = current_date
+            max_lookback = 7  # Look back up to 7 days for weekends/holidays
+            
+            for _ in range(max_lookback):
+                check_date_str = check_date.isoformat()
+                price = price_map.get((symbol, check_date_str))
+                if price:
+                    break
+                check_date -= timedelta(days=1)
+            
+            # If still no price, use current stock price as fallback
+            if not price and stock.price:
+                price = float(stock.price)
+            
+            if price:
+                portfolio_value += shares * price
+        
+        # Add to result
+        result.append({
+            'date': date_str,
+            'value': round(portfolio_value, 2)
+        })
+        
+        # Move to next date
+        current_date += timedelta(days=1)
+    
+    return result
