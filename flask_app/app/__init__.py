@@ -16,7 +16,7 @@ def create_app(register_routes: bool = True) -> Flask:
     load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
     app = Flask(__name__)
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("SQLALCHEMY_DATABASE_URI")
     app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 
     CORS(app)
@@ -27,4 +27,8 @@ def create_app(register_routes: bool = True) -> Flask:
     if register_routes:
         from .routes import routes_bp
         app.register_blueprint(routes_bp)
+    
+    from app.routes import cron_bp
+    app.register_blueprint(cron_bp)
+
     return app

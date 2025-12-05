@@ -8,9 +8,16 @@ from .seed import seed_database
 import yfinance as yf
 from datetime import datetime, timezone
 from .scoring import QlibConfig, load_config_from_env, run_scoring_workflow
+import os
 
 
 routes_bp = Blueprint('routes', __name__)
+
+from app.services import run_daily_job  # import the function from step 1
+
+cron_bp = Blueprint("cron", __name__)  # separate blueprint for cron routes
+
+CRON_SECRET = os.getenv("CRON_SECRET")  # set in Vercel dashboard
 
 @routes_bp.route('/signup', methods=['POST'])
 def signup():
@@ -786,3 +793,22 @@ def delete_holding(holding_id):
     db.session.commit()
     
     return jsonify({'message': 'Holding deleted successfully'}), 200
+
+
+@cron_bp.route("/cron/daily", methods=["POST"])
+def cron_daily():
+    """
+    Endpoint triggered by Vercel Cron once per day.
+    Uses a secret header for basic protection.
+    """
+    # Read header from request
+    auth_header = request.headers.get("X-CRON-SECRET")
+
+    # If secret exists in env, require match
+    if CRON_SECRET and auth_header != CRON_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    # Run the job
+    result = run_daily_job()
+
+    return jsonify({"status": "ok", "result": result}), 200
