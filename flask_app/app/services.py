@@ -2,8 +2,10 @@ from sqlalchemy import select
 from .extensions import db
 from decimal import Decimal
 from .models import User, Stock, Score, Log, Transaction, Account, Holding, MarketData
+from .mongo_models import Stock as MongoStock, MarketData as MongoMarketData
 import yfinance as yf
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
+from collections import defaultdict
 
 # USERS
 def upsert_user(username: str, email: str, password_plain: str, balance=0.0, risk_averse='no') -> User:
@@ -62,11 +64,11 @@ def add_transaction(email: str, symbol: str, txn_type: str, qty: int, price: flo
 def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) -> Transaction:
     """
     Process a complete transaction: validate, update account, update holdings, and record transaction.
-    Uses current stock price from the database.
+    Uses current stock price from MongoDB.
     
     Args:
         user_id: ID of the user making the transaction
-        stock_id: ID of the stock being traded
+        stock_id: ID of the stock being traded (MySQL stock_id)
         txn_type: 'buy' or 'sell'
         qty: Quantity of shares
     
@@ -76,19 +78,20 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
     Raises:
         ValueError: If validation fails (insufficient funds/holdings/stock not found)
     """
-    # Get stock and its current price
-    stock = db.session.execute(
-        select(Stock).where(Stock.stock_id == stock_id)
-    ).scalar_one_or_none()
+    # Get stock price from MongoDB using stockId
+    try:
+        stock = MongoStock.objects(stock_id=stock_id).first()
+    except Exception as e:
+        raise ValueError(f"Error querying MongoDB for stock_id {stock_id}: {str(e)}")
     
     if not stock:
-        raise ValueError(f"Stock with ID {stock_id} not found")
+        raise ValueError(f"Stock with ID {stock_id} not found in MongoDB")
     
     if not stock.price or stock.price <= 0:
         raise ValueError(f"Stock {stock.symbol} does not have a valid price")
     
-    price = stock.price
-    total_cost = Decimal(str(price)) * qty
+    price = Decimal(str(stock.price))
+    total_cost = price * Decimal(qty)
     
     # Get or create account
     account = db.session.execute(
@@ -97,6 +100,10 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
     
     if not account:
         raise ValueError("Account not found. Please create an account first.")
+    
+    # Ensure balance is Decimal (handle legacy float values)
+    if not isinstance(account.balance, Decimal):
+        account.balance = Decimal(str(account.balance))
     
     # Validate and update based on transaction type
     if txn_type == 'buy':
@@ -168,30 +175,54 @@ def search_stocks(text: str, country=None, min_price: float = 0, max_price: floa
     
     Args:
         text: Search text for symbol or company name
-        country: Single country string, list of countries, or None
+        country: Single country string, comma-separated string, list of countries, or None
         min_price: Minimum price filter
         max_price: Maximum price filter
-        sector: Single sector string, list of sectors, or None
-        sub_sector: Single sub_sector string, list of sub_sectors, or None
+        sector: Single sector string, comma-separated string, list of sectors, or None
+        sub_sector: Single sub_sector string, comma-separated string, list of sub_sectors, or None
     """
+    
+    # Helper function to normalize filter values (handles comma-separated strings)
+    def normalize_filter(value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return [v.strip() for v in value if v.strip()] if value else None
+        if isinstance(value, str) and value:
+            # Split comma-separated string into list
+            parts = [v.strip() for v in value.split(',') if v.strip()]
+            return parts if parts else None
+        return None
+    
+    # Normalize all filter values
+    country_list = normalize_filter(country)
+    sector_list = normalize_filter(sector)
+    sub_sector_list = normalize_filter(sub_sector)
+    
     query = select(Stock)
     
-    # Search text in Symbol or Company (case-insensitive)
+    # Search text 
     if text:
         search_pattern = f"%{text}%"
+        starts_pattern = f"{text}%"
         query = query.where(
             db.or_(
                 Stock.symbol.ilike(search_pattern),
                 Stock.company.ilike(search_pattern)
             )
+        ).order_by(
+            # Prioritize: symbol starts with > company starts with > others
+            db.case(
+                (Stock.symbol.ilike(starts_pattern), 1),
+                (Stock.company.ilike(starts_pattern), 2),
+                else_=3
+            ),
+            Stock.symbol  # Then alphabetically
         )
     
-    # Apply country filter - handles both single value and list
-    if country:
-        if isinstance(country, list) and len(country) > 0:
-            query = query.where(Stock.country.in_(country))
-        elif isinstance(country, str) and country:
-            query = query.where(Stock.country == country)
+    # Apply country filter
+    if country_list:
+        query = query.where(Stock.country.in_(country_list))
     
     # Apply price range filter if both min and max are not 0
     if min_price > 0 or max_price > 0:
@@ -200,22 +231,16 @@ def search_stocks(text: str, country=None, min_price: float = 0, max_price: floa
         if max_price > 0:
             query = query.where(Stock.price <= max_price)
     
-    # Apply sector filter - handles both single value and list
-    if sector:
-        if isinstance(sector, list) and len(sector) > 0:
-            query = query.where(Stock.sector.in_(sector))
-        elif isinstance(sector, str) and sector:
-            query = query.where(Stock.sector == sector)
+    # Apply sector filter
+    if sector_list:
+        query = query.where(Stock.sector.in_(sector_list))
     
-    # Apply sub_sector filter - handles both single value and list
-    if sub_sector:
-        if isinstance(sub_sector, list) and len(sub_sector) > 0:
-            query = query.where(Stock.sub_sector.in_(sub_sector))
-        elif isinstance(sub_sector, str) and sub_sector:
-            query = query.where(Stock.sub_sector == sub_sector)
+    # Apply sub_sector filter
+    if sub_sector_list:
+        query = query.where(Stock.sub_sector.in_(sub_sector_list))
     
-    # Limit to 10 results
-    query = query.limit(10)
+    # Limit to 50 results
+    query = query.limit(50)
     
     results = db.session.execute(query).scalars().all()
     return results
@@ -265,3 +290,151 @@ def create_market_data_from_yahoo(symbol: str) -> MarketData:
     )
     
     return market_data
+
+
+def run_daily_job():
+    """
+    Daily job run by Vercel Cron.
+
+    Place your real logic here.
+    Example actions:
+    - fetch stock data
+    - update scores
+    - clean old rows from database
+    """
+    now_utc = datetime.utcnow().isoformat()
+    print(f"[CRON] Daily job started at {now_utc}")
+
+    # TODO: replace this with real work
+    # Example:
+    # update_signals()
+    # recalc_scores()
+
+    print("[CRON] Daily job finished")
+    return {"timestamp": now_utc}
+  
+def calculate_portfolio_history(user_id: int):
+    """
+    Calculate daily portfolio value from first transaction to today.
+    
+    Args:
+        user_id: ID of the user
+    
+    Returns:
+        List of dicts with 'date' and 'value' keys, or empty list if no transactions
+    """
+    # Get all user transactions ordered by date
+    transactions = db.session.execute(
+        select(Transaction)
+        .where(Transaction.user_id == user_id)
+        .order_by(Transaction.date_transac)
+    ).scalars().all()
+    
+    if not transactions:
+        return []
+    
+    # Get date range
+    start_date = transactions[0].date_transac.date()
+    end_date = date.today()
+    
+    # Build a map of stock_id to symbol from MongoDB
+    stock_ids = set(t.stock_id for t in transactions)
+    stock_map = {}  # {stock_id: MongoStock}
+    
+    for stock_id in stock_ids:
+        stock = MongoStock.objects(stock_id=stock_id).first()
+        if stock:
+            stock_map[stock_id] = stock
+    
+    # Get historical prices from MongoDB MarketData
+    # Build a map of (symbol, date) -> price
+    price_map = {}  # {(symbol, date_str): price}
+    
+    for stock_id, stock in stock_map.items():
+        symbol = stock.symbol
+        # Query MarketData for this stock
+        # MongoDB stores datetime, we need to match by date
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        end_datetime = datetime.combine(end_date, datetime.max.time())
+        
+        market_data_records = MongoMarketData.objects(
+            instrument=symbol,
+            date_time__gte=start_datetime,
+            date_time__lte=end_datetime
+        ).only('date_time', 'close')
+        
+        for record in market_data_records:
+            record_date = record.date_time.date().isoformat()
+            price_map[(symbol, record_date)] = float(record.close)
+    
+    # Calculate portfolio value for each date
+    result = []
+    current_holdings = defaultdict(int)  # {stock_id: shares}
+    transaction_index = 0
+    
+    # Iterate through each date
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.isoformat()
+        
+        # Process all transactions on this date
+        while transaction_index < len(transactions):
+            txn = transactions[transaction_index]
+            txn_date = txn.date_transac.date()
+            
+            if txn_date > current_date:
+                break
+            
+            if txn_date == current_date:
+                # Update holdings based on transaction type
+                if txn.transaction_type.lower() == 'buy':
+                    current_holdings[txn.stock_id] += txn.quantity_transac
+                elif txn.transaction_type.lower() == 'sell':
+                    current_holdings[txn.stock_id] -= txn.quantity_transac
+                
+                transaction_index += 1
+            else:
+                transaction_index += 1
+        
+        # Calculate portfolio value for this date
+        portfolio_value = 0.0
+        
+        for stock_id, shares in current_holdings.items():
+            if shares <= 0:
+                continue
+            
+            stock = stock_map.get(stock_id)
+            if not stock:
+                continue
+            
+            symbol = stock.symbol
+            
+            # Try to get price for this date, fallback to previous dates
+            price = None
+            check_date = current_date
+            max_lookback = 7  # Look back up to 7 days for weekends/holidays
+            
+            for _ in range(max_lookback):
+                check_date_str = check_date.isoformat()
+                price = price_map.get((symbol, check_date_str))
+                if price:
+                    break
+                check_date -= timedelta(days=1)
+            
+            # If still no price, use current stock price as fallback
+            if not price and stock.price:
+                price = float(stock.price)
+            
+            if price:
+                portfolio_value += shares * price
+        
+        # Add to result
+        result.append({
+            'date': date_str,
+            'value': round(portfolio_value, 2)
+        })
+        
+        # Move to next date
+        current_date += timedelta(days=1)
+    
+    return result

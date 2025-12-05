@@ -32,3 +32,4 @@ wheel==0.45.1
 Flask-Migrate==4.1.0
 yfinance==0.2.66
 pymongo[srv]==3.12
+mongoengine==0.29.1

@@ -3,6 +3,14 @@ import shutil
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
+from flask import Blueprint, request, jsonify, current_app
+from sqlalchemy import select, func
+from . import db, jwt
+from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
+from .mongo_models import Stock as MongoStock, MarketData as MongoMarketData
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from .services import upsert_user, upserstock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo, calculate_portfolio_history
+from .seed import seed_database
 import yfinance as yf
 from pymongo import UpdateOne, DeleteMany
 from flask import Blueprint, jsonify, current_app, request
@@ -22,7 +30,6 @@ except ImportError:  # pragma: no cover - runtime safety
 from . import db, jwt
 from .models import Account, Holding, MarketData, Score, Stock, Transaction, User
 from .scoring import QlibConfig, load_config_from_env, run_scoring_workflow
-from .seed import seed_database
 from .services import (
     add_transaction,
     create_market_data_from_yahoo,
@@ -789,25 +796,81 @@ def _dedupe_collection_chunked(collection, fields: list[str], partition_field: s
 def health():
     return jsonify({"status": "ok"}), 200
 
+from app.services import run_daily_job  # import the function from step 1
+
+cron_bp = Blueprint("cron", __name__)  # separate blueprint for cron routes
+
+CRON_SECRET = os.getenv("CRON_SECRET")  # set in Vercel dashboard
 
 @routes_bp.route('/signup', methods=['POST'])
 def signup():
     data = request.get_json()
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already registered'}), 400
+    
     user = User(username=data['username'], email=data['email'])
     user.set_password(data['password'])
     db.session.add(user)
+    db.session.flush()  # Get user_id before creating account
+    
+    # Auto-create account with default balance
+    from decimal import Decimal
+    account = Account(user_id=user.user_id, balance=Decimal('10000.00'))
+    db.session.add(account)
     db.session.commit()
+    
     return jsonify({'message': 'User created successfully'}), 201
 
 @routes_bp.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
-    user = User.query.filter_by(username=data['username']).first() or User.query.filter_by(email=data['username']).first()
+    username_or_email = data.get('username')
+    
+    # Query for user by username OR email
+    user = User.query.filter(
+        db.or_(User.username == username_or_email, User.email == username_or_email)
+    ).first()
+    
     if user and user.check_password(data['password']):
         token = create_access_token(identity=str(user.user_id))
-        return jsonify({'token': token}), 200
+        
+        # Get account balance
+        account = Account.query.filter_by(user_id=user.user_id).first()
+        
+        # Calculate total holdings value (using MySQL Stock table as fallback)
+        holdings = Holding.query.filter(Holding.user_id == user.user_id).all()
+        total_holdings_value = 0.0
+        
+        for holding in holdings:
+            stock_price = None
+            
+            # Try MongoDB first
+            try:
+                mongo_stock = MongoStock.objects(stock_id=holding.stock_id).first()
+                if mongo_stock and mongo_stock.price:
+                    stock_price = float(mongo_stock.price)
+            except Exception:
+                pass  # MongoDB failed, will try MySQL below
+            
+            # Fallback to MySQL if MongoDB didn't return a price
+            if stock_price is None:
+                sql_stock = Stock.query.get(holding.stock_id)
+                if sql_stock and sql_stock.price:
+                    stock_price = float(sql_stock.price)
+            
+            if stock_price:
+                total_holdings_value += stock_price * holding.quantity
+        
+        return jsonify({
+            'token': token,
+            'user': {
+                'user_id': user.user_id,
+                'username': user.username,
+                'email': user.email,
+                'balance': float(account.balance) if account else 0.00,
+                'holdings_value': total_holdings_value
+            }
+        }), 200
     return jsonify({'error': 'Invalid credentials'}), 401
 
 
@@ -1026,9 +1089,14 @@ def execute_transaction():
         }), 201
         
     except ValueError as e:
+        db.session.rollback()
+        print(f"ValueError: {str(e)}")
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         db.session.rollback()
+        import traceback
+        print(f"Exception: {str(e)}")
+        traceback.print_exc()
         return jsonify({'error': f'Transaction failed: {str(e)}'}), 500
 
 
@@ -1039,21 +1107,23 @@ def get_user_transactions():
     """Get all transactions for the authenticated user, sorted by date (newest first)"""
     user_id = get_jwt_identity()
     
-    # Query transactions with joined stock data, filter by user_id, sort by date descending
-    transactions = db.session.query(Transaction, Stock)\
-        .join(Stock, Transaction.stock_id == Stock.stock_id)\
+    # Query transactions from MySQL
+    transactions = Transaction.query\
         .filter(Transaction.user_id == user_id)\
         .order_by(Transaction.date_transac.desc())\
         .all()
     
     transactions_data = []
-    for transaction, stock in transactions:
+    for transaction in transactions:
+        # Fetch stock data from MongoDB
+        stock = MongoStock.objects(stock_id=transaction.stock_id).first()
+        
         transactions_data.append({
             'transaction_id': transaction.transaction_id,
             'user_id': transaction.user_id,
             'stock_id': transaction.stock_id,
-            'stock_symbol': stock.symbol,
-            'stock_company': stock.company,
+            'stock_symbol': stock.symbol if stock else None,
+            'stock_company': stock.company if stock else None,
             'transaction_type': transaction.transaction_type,
             'quantity': transaction.quantity_transac,
             'price': float(transaction.price_transac),
@@ -1077,7 +1147,8 @@ def get_transaction(transaction_id):
     if not transaction:
         return jsonify({'error': 'Transaction not found'}), 404
     
-    stock = Stock.query.get(transaction.stock_id)
+    # Fetch stock data from MongoDB
+    stock = MongoStock.objects(stock_id=transaction.stock_id).first()
     
     return jsonify({
         'transaction_id': transaction.transaction_id,
@@ -1321,6 +1392,30 @@ def get_stock_by_symbol(symbol):
         'quantity': stock.quantity,
         'last_updated': stock.last_updated.isoformat() if stock.last_updated else None
     }), 200
+
+
+@routes_bp.route('/stocks/all/symbols', methods=['GET'])
+def get_all_stock_symbols():
+    """
+    Get all stock symbols and company names from the database.
+    
+    GET /stocks/all/symbols
+    
+    Returns:
+    [
+        {"symbol": "AAPL", "company": "Apple Inc."},
+        {"symbol": "MSFT", "company": "Microsoft Corporation"},
+        ...
+    ]
+    """
+    stocks = db.session.execute(
+        select(Stock.symbol, Stock.company).order_by(Stock.symbol)
+    ).all()
+    
+    return jsonify([
+        {'symbol': symbol, 'company': company}
+        for symbol, company in stocks
+    ]), 200
 
 @routes_bp.route('/yahoo/<symbol>', methods=['GET'])
 def get_yahoo_finance_data(symbol):
@@ -1976,20 +2071,94 @@ def _get_growth_map(stock_ids):
 @routes_bp.route('/accounts', methods=['GET'])
 @jwt_required()
 def get_user_account():
-    """Get the account for the authenticated user"""
+    """Get the account for the authenticated user with total holdings value"""
     user_id = get_jwt_identity()
     account = Account.query.filter_by(user_id=user_id).first()
     
     if not account:
         return jsonify({'error': 'Account not found'}), 404
     
-    return jsonify({
-        'account_id': account.account_id,
+    # Calculate total holdings value from MongoDB stock prices
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
+    total_holdings_value = 0.0
+    
+    for holding in holdings:
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        if stock and stock.price:
+            total_holdings_value += float(stock.price) * holding.quantity
+    
+    response = jsonify({
         'user_id': account.user_id,
-        'balance': float(account.balance),
+        'balance': total_holdings_value,  # Total value of holdings
+        'account_balance': float(account.balance),  # Account balance (cash)
         'created_at': account.created_at.isoformat() if account.created_at else None,
         'updated_at': account.updated_at.isoformat() if account.updated_at else None
-    }), 200
+    })
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
+
+
+@routes_bp.route('/account/<int:user_id>', methods=['GET'])
+@jwt_required()
+def get_account_by_user_id(user_id):
+    """Get account by user_id (with authorization check)"""
+    requesting_user_id = int(get_jwt_identity())
+    
+    # Authorization: user can only access their own account
+    if requesting_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    account = Account.query.filter_by(user_id=user_id).first()
+    
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
+    
+    # Calculate total holdings value from MongoDB stock prices
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
+    total_holdings_value = 0.0
+    
+    for holding in holdings:
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        if stock and stock.price:
+            total_holdings_value += float(stock.price) * holding.quantity
+    
+    response = jsonify({
+        'user_id': account.user_id,
+        'balance': total_holdings_value,  # Total value of holdings
+        'account_balance': float(account.balance),  # Account balance (cash)
+        'created_at': account.created_at.isoformat() if account.created_at else None,
+        'updated_at': account.updated_at.isoformat() if account.updated_at else None
+    })
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
+
+
+@routes_bp.route('/portfolio/history/<int:user_id>', methods=['GET'])
+@jwt_required()
+def get_portfolio_history(user_id):
+    """Get historical portfolio values from first transaction to today"""
+    requesting_user_id = int(get_jwt_identity())
+    
+    # Authorization: user can only access their own portfolio history
+    if requesting_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    try:
+        history = calculate_portfolio_history(user_id)
+        response = jsonify(history)
+        # Prevent caching to ensure fresh data after transactions
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response, 200
+    except Exception as e:
+        return jsonify({'error': f'Failed to calculate portfolio history: {str(e)}'}), 500
 
 
 @routes_bp.route('/accounts', methods=['POST'])
@@ -2013,7 +2182,6 @@ def create_account():
     
     return jsonify({
         'message': 'Account created successfully',
-        'account_id': account.account_id,
         'user_id': account.user_id,
         'balance': float(account.balance)
     }), 201
@@ -2037,7 +2205,7 @@ def update_account():
     
     return jsonify({
         'message': 'Account updated successfully',
-        'account_id': account.account_id,
+        'user_id': account.user_id,
         'balance': float(account.balance),
         'updated_at': account.updated_at.isoformat() if account.updated_at else None
     }), 200
@@ -2053,27 +2221,108 @@ def get_user_holdings():
     """Get all holdings for the authenticated user, sorted alphabetically by stock symbol"""
     user_id = get_jwt_identity()
     
-    # Query holdings with joined stock data, filter by user_id, sort by stock symbol
-    holdings = db.session.query(Holding, Stock)\
-        .join(Stock, Holding.stock_id == Stock.stock_id)\
-        .filter(Holding.user_id == user_id)\
-        .order_by(Stock.symbol)\
-        .all()
+    # Query holdings from MySQL
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
     
     holdings_data = []
-    for holding, stock in holdings:
+    for holding in holdings:
+        # Fetch stock data from MongoDB
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        
+        # Calculate average purchase price from transactions
+        transactions = Transaction.query.filter(
+            Transaction.user_id == user_id,
+            Transaction.stock_id == holding.stock_id,
+            Transaction.transaction_type == 'buy'
+        ).all()
+        
+        total_cost = sum(float(t.price_transac) * t.quantity_transac for t in transactions)
+        total_shares = sum(t.quantity_transac for t in transactions)
+        avg_purchase_price = total_cost / total_shares if total_shares > 0 else 0
+        
+        # Calculate growth percentage
+        current_price = float(stock.price) if stock and stock.price else 0
+        growth_percent = ((current_price - avg_purchase_price) / avg_purchase_price * 100) if avg_purchase_price > 0 else 0
+        
         holdings_data.append({
             'holding_id': holding.holding_id,
             'user_id': holding.user_id,
             'stock_id': holding.stock_id,
-            'stock_symbol': stock.symbol,
-            'stock_company': stock.company,
-            'stock_price': float(stock.price) if stock.price else None,
+            'stock_symbol': stock.symbol if stock else None,
+            'stock_company': stock.company if stock else None,
+            'stock_price': current_price,
             'quantity': holding.quantity,
+            'purchase_price': round(avg_purchase_price, 2),
+            'growth_percent': round(growth_percent, 2),
             'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
         })
     
-    return jsonify(holdings_data), 200
+    # Sort by stock symbol
+    holdings_data.sort(key=lambda x: x['stock_symbol'] or '')
+    
+    response = jsonify(holdings_data)
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
+
+
+@routes_bp.route('/holdings/<int:user_id>', methods=['GET'])
+@jwt_required()
+def get_holdings_by_user_id(user_id):
+    """Get holdings by user_id (with authorization check)"""
+    requesting_user_id = int(get_jwt_identity())
+    
+    # Authorization: user can only access their own holdings
+    if requesting_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    # Query holdings from MySQL
+    holdings = Holding.query.filter(Holding.user_id == user_id).all()
+    
+    holdings_data = []
+    for holding in holdings:
+        # Fetch stock data from MongoDB
+        stock = MongoStock.objects(stock_id=holding.stock_id).first()
+        
+        # Calculate average purchase price from transactions
+        transactions = Transaction.query.filter(
+            Transaction.user_id == user_id,
+            Transaction.stock_id == holding.stock_id,
+            Transaction.transaction_type == 'buy'
+        ).all()
+        
+        total_cost = sum(float(t.price_transac) * t.quantity_transac for t in transactions)
+        total_shares = sum(t.quantity_transac for t in transactions)
+        avg_purchase_price = total_cost / total_shares if total_shares > 0 else 0
+        
+        # Calculate growth percentage
+        current_price = float(stock.price) if stock and stock.price else 0
+        growth_percent = ((current_price - avg_purchase_price) / avg_purchase_price * 100) if avg_purchase_price > 0 else 0
+        
+        holdings_data.append({
+            'holding_id': holding.holding_id,
+            'user_id': holding.user_id,
+            'stock_id': holding.stock_id,
+            'stock_symbol': stock.symbol if stock else None,
+            'stock_company': stock.company if stock else None,
+            'stock_price': current_price,
+            'quantity': holding.quantity,
+            'purchase_price': round(avg_purchase_price, 2),
+            'growth_percent': round(growth_percent, 2),
+            'updated_at': holding.updated_at.isoformat() if holding.updated_at else None
+        })
+    
+    # Sort by stock symbol
+    holdings_data.sort(key=lambda x: x['stock_symbol'] or '')
+    
+    response = jsonify(holdings_data)
+    # Prevent caching to ensure fresh data after transactions
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response, 200
 
 
 @routes_bp.route('/holdings', methods=['POST'])
@@ -2089,8 +2338,8 @@ def create_or_update_holding():
     if not stock_id:
         return jsonify({'error': 'stock_id is required'}), 400
     
-    # Check if stock exists
-    stock = Stock.query.get(stock_id)
+    # Check if stock exists in MongoDB
+    stock = MongoStock.objects(stock_id=stock_id).first()
     if not stock:
         return jsonify({'error': 'Stock not found'}), 404
     
@@ -2136,3 +2385,22 @@ def delete_holding(holding_id):
     db.session.commit()
     
     return jsonify({'message': 'Holding deleted successfully'}), 200
+
+
+@cron_bp.route("/cron/daily", methods=["POST"])
+def cron_daily():
+    """
+    Endpoint triggered by Vercel Cron once per day.
+    Uses a secret header for basic protection.
+    """
+    # Read header from request
+    auth_header = request.headers.get("X-CRON-SECRET")
+
+    # If secret exists in env, require match
+    if CRON_SECRET and auth_header != CRON_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    # Run the job
+    result = run_daily_job()
+
+    return jsonify({"status": "ok", "result": result}), 200

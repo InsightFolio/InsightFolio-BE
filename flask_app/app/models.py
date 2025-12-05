@@ -12,8 +12,7 @@ class User(db.Model):
     username = db.Column('Username', db.String(50), nullable=False)
     email = db.Column('Email', db.String(100), unique=True, nullable=False)
     password = db.Column('Password', db.String(255), nullable=False)
-    balance = db.Column('Balance', db.Numeric(15, 2), default=0.00)
-    risk_averse = db.Column('RiskAverse', Enum('yes', 'no', name='risk_averse_enum'), nullable=False, default='no')
+    risk_averse = db.Column('RiskAverse', db.String(3), nullable=False, default='no')
     registered_at = db.Column('RegisteredAt', db.DateTime, default=lambda: datetime.now(timezone.utc))
     
     # Relationships
@@ -158,14 +157,13 @@ class MarketData(db.Model):
 class Account(db.Model):
     __tablename__ = 'accounts'
     
-    account_id = db.Column('AccountID', db.Integer, primary_key=True, autoincrement=True)
-    user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), unique=True, nullable=False)
-    balance = db.Column('Balance', db.Numeric(15, 2), default=0.00, nullable=False)
+    user_id = db.Column('UserID', db.Integer, db.ForeignKey('users.UserID', ondelete='CASCADE', onupdate='CASCADE'), primary_key=True, nullable=False)
+    balance = db.Column('Balance', db.Numeric(15, 2), default=10000.00, nullable=False)
     created_at = db.Column('CreatedAt', db.DateTime, default=datetime.utcnow)
     updated_at = db.Column('UpdatedAt', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def __repr__(self):
-        return f'<Account {self.account_id} - User {self.user_id}>'
+        return f'<Account User {self.user_id}>'
 
 
 # =========================

@@ -4,6 +4,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from pathlib import Path
+from mongoengine import connect
 
 
 def create_app(register_routes: bool = True, database_url: str | None = None) -> Flask:
@@ -22,6 +23,11 @@ def create_app(register_routes: bool = True, database_url: str | None = None) ->
         database_url or os.getenv("DATABASE_URL") or f"sqlite:///{default_sqlite}"
     )
     app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
+    
+    # Connect to MongoDB Atlas with database name
+    mongodb_uri = os.getenv("MONGODB_URL")
+    if mongodb_uri:
+        connect(db='marketdb', host=mongodb_uri)
 
     CORS(app)
     db.init_app(app)
@@ -31,4 +37,8 @@ def create_app(register_routes: bool = True, database_url: str | None = None) ->
     if register_routes:
         from .routes import routes_bp
         app.register_blueprint(routes_bp)
+    
+    from app.routes import cron_bp
+    app.register_blueprint(cron_bp)
+
     return app
