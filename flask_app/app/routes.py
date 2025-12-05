@@ -9,7 +9,7 @@ from . import db, jwt
 from .models import User, Stock, Account, Holding, Transaction, Score, MarketData
 from .mongo_models import Stock as MongoStock, MarketData as MongoMarketData
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .services import upsert_user, upserstock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo, calculate_portfolio_history
+from .services import upsert_user, upsert_stock, add_transaction, search_stocks, process_transaction, create_market_data_from_yahoo, calculate_portfolio_history
 from .seed import seed_database
 import yfinance as yf
 from pymongo import UpdateOne, DeleteMany
