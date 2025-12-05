@@ -2,6 +2,7 @@ from sqlalchemy import select
 from .extensions import db
 from decimal import Decimal
 from .models import User, Stock, Score, Log, Transaction, Account, Holding, MarketData
+from .mongo_models import Stock as MongoStock, MarketData as MongoMarketData
 import yfinance as yf
 from datetime import datetime, timezone
 
@@ -62,11 +63,11 @@ def add_transaction(email: str, symbol: str, txn_type: str, qty: int, price: flo
 def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) -> Transaction:
     """
     Process a complete transaction: validate, update account, update holdings, and record transaction.
-    Uses current stock price from the database.
+    Uses current stock price from MongoDB.
     
     Args:
         user_id: ID of the user making the transaction
-        stock_id: ID of the stock being traded
+        stock_id: ID of the stock being traded (MySQL stock_id)
         txn_type: 'buy' or 'sell'
         qty: Quantity of shares
     
@@ -76,19 +77,20 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
     Raises:
         ValueError: If validation fails (insufficient funds/holdings/stock not found)
     """
-    # Get stock and its current price
-    stock = db.session.execute(
-        select(Stock).where(Stock.stock_id == stock_id)
-    ).scalar_one_or_none()
+    # Get stock price from MongoDB using stockId
+    try:
+        stock = MongoStock.objects(stock_id=stock_id).first()
+    except Exception as e:
+        raise ValueError(f"Error querying MongoDB for stock_id {stock_id}: {str(e)}")
     
     if not stock:
-        raise ValueError(f"Stock with ID {stock_id} not found")
+        raise ValueError(f"Stock with ID {stock_id} not found in MongoDB")
     
     if not stock.price or stock.price <= 0:
         raise ValueError(f"Stock {stock.symbol} does not have a valid price")
     
-    price = stock.price
-    total_cost = Decimal(str(price)) * qty
+    price = Decimal(str(stock.price))
+    total_cost = price * Decimal(qty)
     
     # Get or create account
     account = db.session.execute(
@@ -97,6 +99,10 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
     
     if not account:
         raise ValueError("Account not found. Please create an account first.")
+    
+    # Ensure balance is Decimal (handle legacy float values)
+    if not isinstance(account.balance, Decimal):
+        account.balance = Decimal(str(account.balance))
     
     # Validate and update based on transaction type
     if txn_type == 'buy':
