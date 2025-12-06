@@ -292,26 +292,6 @@ def create_market_data_from_yahoo(symbol: str) -> MarketData:
     return market_data
 
 
-def run_daily_job():
-    """
-    Daily job run by Vercel Cron.
-
-    Place your real logic here.
-    Example actions:
-    - fetch stock data
-    - update scores
-    - clean old rows from database
-    """
-    now_utc = datetime.utcnow().isoformat()
-    print(f"[CRON] Daily job started at {now_utc}")
-
-    # TODO: replace this with real work
-    # Example:
-    # update_signals()
-    # recalc_scores()
-
-    print("[CRON] Daily job finished")
-    return {"timestamp": now_utc}
   
 def calculate_portfolio_history(user_id: int):
     """
