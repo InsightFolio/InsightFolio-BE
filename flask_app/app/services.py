@@ -168,10 +168,10 @@ def process_transaction(user_id: int, stock_id: int, txn_type: str, qty: int) ->
 
 # SEARCH STOCKS
 def search_stocks(text: str, country=None, min_price: float = 0, max_price: float = 0, 
-                  sector=None, sub_sector=None) -> list[Stock]:
+                  sector=None, sub_sector=None):
     """
-    Search stocks based on text and optional filters.
-    Returns first 10 matching results.
+    Search stocks in MongoDB based on text and optional filters.
+    Returns first 50 matching results.
     
     Args:
         text: Search text for symbol or company name
@@ -199,51 +199,62 @@ def search_stocks(text: str, country=None, min_price: float = 0, max_price: floa
     sector_list = normalize_filter(sector)
     sub_sector_list = normalize_filter(sub_sector)
     
-    query = select(Stock)
+    # Build MongoDB query
+    from mongoengine import Q
     
-    # Search text 
+    query = MongoStock.objects
+    
+    # Search text in _id (symbol) or company (case-insensitive with prioritization)
     if text:
-        search_pattern = f"%{text}%"
-        starts_pattern = f"{text}%"
-        query = query.where(
-            db.or_(
-                Stock.symbol.ilike(search_pattern),
-                Stock.company.ilike(search_pattern)
-            )
-        ).order_by(
-            # Prioritize: symbol starts with > company starts with > others
-            db.case(
-                (Stock.symbol.ilike(starts_pattern), 1),
-                (Stock.company.ilike(starts_pattern), 2),
-                else_=3
-            ),
-            Stock.symbol  # Then alphabetically
+        # Filter by symbol or company containing the text
+        query = query.filter(
+            Q(_id__icontains=text) | Q(company__icontains=text)
         )
     
     # Apply country filter
     if country_list:
-        query = query.where(Stock.country.in_(country_list))
+        query = query.filter(country__in=country_list)
     
-    # Apply price range filter if both min and max are not 0
-    if min_price > 0 or max_price > 0:
-        if min_price > 0:
-            query = query.where(Stock.price >= min_price)
-        if max_price > 0:
-            query = query.where(Stock.price <= max_price)
+    # Apply price range filter
+    if min_price > 0:
+        query = query.filter(price__gte=min_price)
+    if max_price > 0:
+        query = query.filter(price__lte=max_price)
     
     # Apply sector filter
     if sector_list:
-        query = query.where(Stock.sector.in_(sector_list))
+        query = query.filter(sector__in=sector_list)
     
     # Apply sub_sector filter
     if sub_sector_list:
-        query = query.where(Stock.sub_sector.in_(sub_sector_list))
+        query = query.filter(sub_sector__in=sub_sector_list)
     
-    # Limit to 50 results
-    query = query.limit(50)
+    # Get results and sort in Python for prioritization
+    # Fetch more results to ensure we have enough after sorting
+    all_results = list(query.limit(200))
     
-    results = db.session.execute(query).scalars().all()
-    return results
+    if text:
+        def sort_key(stock):
+            symbol = stock.symbol.upper()
+            company = stock.company.upper() if stock.company else ""
+            text_upper = text.upper()
+            
+            # Priority 1: Symbol starts with search text
+            if symbol.startswith(text_upper):
+                return (1, symbol)
+            # Priority 2: Company starts with search text
+            elif company.startswith(text_upper):
+                return (2, symbol)
+            # Priority 3: Contains text anywhere
+            else:
+                return (3, symbol)
+        
+        # Sort by priority and then alphabetically, limit to 50
+        sorted_results = sorted(all_results, key=sort_key)[:50]
+        return sorted_results
+    else:
+        # No text search, return results sorted alphabetically by symbol
+        return sorted(all_results, key=lambda s: s.symbol)[:50]
 
 # MARKET DATA
 def create_market_data_from_yahoo(symbol: str) -> MarketData:
