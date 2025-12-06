@@ -528,8 +528,8 @@ def _compute_growth_map_from_market_data(symbols: list[str], database_url: str) 
 
 def _compute_price_months_from_market_data(symbols: list[str], database_url: str) -> dict[str, dict[str, float]]:
     """
-    For each symbol, take market_data rows where day == 1, sort by date desc, take latest 6,
-    and map VWAP to price1M..price6M (latest month -> price1M).
+    For each symbol, find the earliest available trading day in each of the latest 6 months
+    and map its VWAP (or close if VWAP is missing) to price1M..price6M.
     """
     if not symbols:
         return {}
@@ -537,30 +537,43 @@ def _compute_price_months_from_market_data(symbols: list[str], database_url: str
     with _session_scope_for_sync(database_url) as session:
         for sym in symbols:
             symbol = str(sym).upper()
+            # Pull a recent window (roughly 13 months at daily bars) to cover missing first-of-month days.
             rows = (
                 session.execute(
                     select(MarketData)
-                    .where(
-                        MarketData.instrument == symbol,
-                        func.extract("day", MarketData.datetime) == 1,
-                    )
+                    .where(MarketData.instrument == symbol)
                     .order_by(MarketData.datetime.desc())
-                    .limit(6)
+                    .limit(400)
                 )
                 .scalars()
                 .all()
             )
             if not rows:
                 continue
-            prices = {}
-            for idx, md in enumerate(rows, start=1):
-                vwap_val = None
+            # Iterate oldest -> newest so the first seen per (year, month) is the earliest day available.
+            month_earliest: dict[tuple[int, int], float | None] = {}
+            for md in reversed(rows):
+                dt = md.datetime
+                key = (dt.year, dt.month)
+                if key in month_earliest:
+                    continue
+                price_val = None
                 if md.vwap is not None:
                     try:
-                        vwap_val = float(md.vwap)
+                        price_val = float(md.vwap)
                     except (TypeError, ValueError):
-                        vwap_val = None
-                prices[f"price{idx}M"] = vwap_val
+                        price_val = None
+                if price_val is None and md.close is not None:
+                    try:
+                        price_val = float(md.close)
+                    except (TypeError, ValueError):
+                        price_val = None
+                month_earliest[key] = price_val
+
+            # Take the latest six months by (year, month) descending.
+            prices = {}
+            for idx, key in enumerate(sorted(month_earliest.keys(), reverse=True)[:6], start=1):
+                prices[f"price{idx}M"] = month_earliest.get(key)
             result[symbol] = prices
     return result
 
@@ -788,8 +801,6 @@ def _dedupe_collection_chunked(collection, fields: list[str], partition_field: s
 @routes_bp.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
-
-from app.services import run_daily_job  # import the function from step 1
 
 cron_bp = Blueprint("cron", __name__)  # separate blueprint for cron routes
 
@@ -1156,6 +1167,127 @@ def popular_stocks():
     if limit == 0:
         return jsonify([]), 200
 
+    use_mongo = (
+        _mongo_market_data_col is not None
+        and _mongo_stocks_col is not None
+        and (request.args.get("backend", "mongo").lower() != "sql")
+    )
+    if use_mongo:
+        # Use latest marketData turnover per instrument from Mongo.
+        pipeline = [
+            {"$match": {"turnover": {"$ne": None}}},
+            {"$sort": {"instrument": 1, "dateTime": -1}},
+            {
+                "$group": {
+                    "_id": "$instrument",
+                    "turnover": {"$first": "$turnover"},
+                    "close": {"$first": "$close"},
+                    "vwap": {"$first": "$vwap"},
+                    "dateTime": {"$first": "$dateTime"},
+                }
+            },
+            {"$sort": {"turnover": -1}},
+            {"$limit": limit},
+        ]
+        turnover_docs = list(_mongo_market_data_col.aggregate(pipeline))
+        symbols = [str(doc.get("_id") or "").upper() for doc in turnover_docs if doc.get("_id")]
+
+        # Fetch stock metadata and growth (if any) from Mongo.
+        stock_map = {}
+        if symbols:
+            stock_map = {
+                str(doc["_id"]).upper(): doc
+                for doc in _mongo_stocks_col.find(
+                    {"_id": {"$in": symbols}},
+                    {
+                        "company": 1,
+                        "sector": 1,
+                        "subSector": 1,
+                        "country": 1,
+                        "price": 1,
+                        "quantity": 1,
+                        "lastUpdated": 1,
+                        "stockId": 1,
+                    },
+                )
+            }
+        score_map = {}
+        if _mongo_scores_col is not None and symbols:
+            score_map = {
+                str(doc.get("symbol") or "").upper(): doc
+                for doc in _mongo_scores_col.find(
+                    {"symbol": {"$in": symbols}},
+                    {"growth": 1},
+                )
+            }
+
+        response = []
+        for doc in turnover_docs:
+            symbol = str(doc.get("_id") or "").upper()
+            stock_doc = stock_map.get(symbol, {})
+            score_doc = score_map.get(symbol, {})
+
+            price_val = decimal_to_float(stock_doc.get("price")) or decimal_to_float(doc.get("close")) or decimal_to_float(doc.get("vwap")) or 0.0
+            change_pct = decimal_to_float(score_doc.get("growth")) or 0.0
+            change_abs = price_val * (change_pct / 100.0) if change_pct else 0.0
+            last_updated = stock_doc.get("lastUpdated")
+
+            response.append(
+                {
+                    "stock_id": stock_doc.get("stockId"),
+                    "symbol": symbol,
+                    "company": stock_doc.get("company"),
+                    "sector": stock_doc.get("sector"),
+                    "sub_sector": stock_doc.get("subSector") or stock_doc.get("sub_sector"),
+                    "country": stock_doc.get("country"),
+                    "price": price_val,
+                    "quantity": stock_doc.get("quantity"),
+                    "last_updated": last_updated.isoformat() if hasattr(last_updated, "isoformat") else None,
+                    "turnover": decimal_to_float(doc.get("turnover")) or 0.0,
+                    "change": change_abs,
+                    "change_pct": change_pct,
+                }
+            )
+
+        # Fallback to top-priced Mongo stocks when no turnover data.
+        if not response and _mongo_stocks_col is not None:
+            fallback_docs = list(
+                _mongo_stocks_col.find(
+                    {},
+                    {
+                        "_id": 1,
+                        "company": 1,
+                        "sector": 1,
+                        "subSector": 1,
+                        "country": 1,
+                        "price": 1,
+                        "quantity": 1,
+                        "lastUpdated": 1,
+                        "stockId": 1,
+                    },
+                ).sort("price", -1).limit(limit)
+            )
+            for doc in fallback_docs:
+                price_val = decimal_to_float(doc.get("price")) or 0.0
+                response.append(
+                    {
+                        "stock_id": doc.get("stockId"),
+                        "symbol": str(doc.get("_id") or "").upper(),
+                        "company": doc.get("company"),
+                        "sector": doc.get("sector"),
+                        "sub_sector": doc.get("subSector") or doc.get("sub_sector"),
+                        "country": doc.get("country"),
+                        "price": price_val,
+                        "quantity": doc.get("quantity"),
+                        "last_updated": doc.get("lastUpdated").isoformat() if hasattr(doc.get("lastUpdated"), "isoformat") else None,
+                        "turnover": 0.0,
+                        "change": 0.0,
+                        "change_pct": 0.0,
+                    }
+                )
+
+        return jsonify(response), 200
+
     turnover_expr = func.sum(Transaction.price_transac * Transaction.quantity_transac)
     popular_query = (
         select(Stock, turnover_expr.label("turnover"))
@@ -1264,6 +1396,80 @@ def stock_by_score():
     limit = max(0, limit)
     if limit == 0:
         return jsonify([]), 200
+
+    # Prefer MongoDB if configured; allow opting back to SQL with ?backend=sql
+    use_mongo = _mongo_scores_col is not None and (request.args.get("backend", "mongo").lower() != "sql")
+    if use_mongo:
+        score_docs = list(
+            _mongo_scores_col.find(
+                {},
+                {
+                    "stockId": 1,
+                    "symbol": 1,
+                    "score": 1,
+                    "quantity": 1,
+                    "volatility": 1,
+                    "growth": 1,
+                    "price1M": 1,
+                    "price2M": 1,
+                    "price3M": 1,
+                    "price4M": 1,
+                    "price5M": 1,
+                    "price6M": 1,
+                },
+            )
+            .sort("score", -1)
+            .limit(limit)
+        )
+
+        # Pull stock metadata (price/company/etc.) in one batch.
+        symbols = [str(doc.get("symbol") or "").upper() for doc in score_docs if doc.get("symbol")]
+        stock_map = {}
+        if _mongo_stocks_col is not None and symbols:
+            stock_map = {
+                str(doc["_id"]).upper(): doc
+                for doc in _mongo_stocks_col.find(
+                    {"_id": {"$in": symbols}},
+                    {"company": 1, "sector": 1, "subSector": 1, "country": 1, "price": 1, "quantity": 1, "lastUpdated": 1},
+                )
+            }
+
+        response = []
+        for doc in score_docs:
+            symbol = str(doc.get("symbol") or "").upper()
+            stock_doc = stock_map.get(symbol, {})
+            price_val = decimal_to_float(stock_doc.get("price")) or 0.0
+            change_pct = decimal_to_float(doc.get("growth")) or 0.0
+            change_abs = price_val * (change_pct / 100.0) if change_pct else 0.0
+            last_updated = stock_doc.get("lastUpdated")
+            quantity_val = doc.get("quantity")
+            if quantity_val is None:
+                quantity_val = stock_doc.get("quantity")
+
+            response.append(
+                {
+                    "stock_id": doc.get("stockId"),
+                    "symbol": symbol,
+                    "company": stock_doc.get("company"),
+                    "sector": stock_doc.get("sector"),
+                    "sub_sector": stock_doc.get("subSector") or stock_doc.get("sub_sector"),
+                    "country": stock_doc.get("country"),
+                    "price": price_val,
+                    "quantity": quantity_val,
+                    "last_updated": last_updated.isoformat() if hasattr(last_updated, "isoformat") else None,
+                    "score": decimal_to_float(doc.get("score")),
+                    "price_1m": decimal_to_float(doc.get("price1M")),
+                    "price_2m": decimal_to_float(doc.get("price2M")),
+                    "price_3m": decimal_to_float(doc.get("price3M")),
+                    "price_4m": decimal_to_float(doc.get("price4M")),
+                    "price_5m": decimal_to_float(doc.get("price5M")),
+                    "price_6m": decimal_to_float(doc.get("price6M")),
+                    "change": change_abs,
+                    "change_pct": change_pct,
+                }
+            )
+
+        return jsonify(response), 200
 
     latest_score_subq = (
         select(Score.stock_id, func.max(Score.score_id).label("score_id"))
@@ -2400,3 +2606,23 @@ def cron_daily():
     result = run_daily_job()
 
     return jsonify({"status": "ok", "result": result}), 200
+
+
+
+def run_daily_job():
+    """
+    Daily job run by Vercel Cron.
+
+    Place your real logic here.
+    Example actions:
+    - fetch stock data
+    - update scores
+    - clean old rows from database
+    """
+    now_utc = datetime.utcnow().isoformat()
+    print(f"[CRON] Daily job started at {now_utc}")
+
+    load_stocks_endpoint()
+
+    print("[CRON] Daily job finished")
+    return {"timestamp": now_utc}
