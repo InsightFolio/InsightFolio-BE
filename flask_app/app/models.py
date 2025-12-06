@@ -65,11 +65,22 @@ class Score(db.Model):
     __tablename__ = 'scores'
     
     score_id = db.Column('ScoreID', db.Integer, primary_key=True, autoincrement=True)
-    stock_id = db.Column('StockID', db.Integer, db.ForeignKey('stocks.StockID', ondelete='CASCADE', onupdate='CASCADE'), nullable=False)
-    price = db.Column('Price', db.Numeric(15, 2))
+    stock_id = db.Column(
+        'StockID',
+        db.Integer,
+        db.ForeignKey('stocks.StockID', ondelete='CASCADE', onupdate='CASCADE'),
+        nullable=False
+    )
     quantity = db.Column('Quantity', db.BigInteger)
     volatility = db.Column('Volatility', db.Numeric(10, 4))
     growth = db.Column('Growth', db.Numeric(10, 4))
+    score = db.Column('Score', db.Numeric(18, 16), nullable=False)
+    price_1m = db.Column('Price1M', db.Numeric(15, 2))
+    price_2m = db.Column('Price2M', db.Numeric(15, 2))
+    price_3m = db.Column('Price3M', db.Numeric(15, 2))
+    price_4m = db.Column('Price4M', db.Numeric(15, 2))
+    price_5m = db.Column('Price5M', db.Numeric(15, 2))
+    price_6m = db.Column('Price6M', db.Numeric(15, 2))
 
     def __repr__(self):
         return f'<Score {self.score_id} for Stock {self.stock_id}>'
