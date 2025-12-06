@@ -827,32 +827,15 @@ def login():
     if user and user.check_password(data['password']):
         token = create_access_token(identity=str(user.user_id))
         
-        # Get account balance
+        # Calculate total holdings value
         account = Account.query.filter_by(user_id=user.user_id).first()
-        
-        # Calculate total holdings value (using MySQL Stock table as fallback)
         holdings = Holding.query.filter(Holding.user_id == user.user_id).all()
         total_holdings_value = 0.0
         
         for holding in holdings:
-            stock_price = None
-            
-            # Try MongoDB first
-            try:
-                mongo_stock = MongoStock.objects(stock_id=holding.stock_id).first()
-                if mongo_stock and mongo_stock.price:
-                    stock_price = float(mongo_stock.price)
-            except Exception:
-                pass  # MongoDB failed, will try MySQL below
-            
-            # Fallback to MySQL if MongoDB didn't return a price
-            if stock_price is None:
-                sql_stock = Stock.query.get(holding.stock_id)
-                if sql_stock and sql_stock.price:
-                    stock_price = float(sql_stock.price)
-            
-            if stock_price:
-                total_holdings_value += stock_price * holding.quantity
+            stock = MongoStock.objects(stock_id=holding.stock_id).first()
+            if stock and stock.price:
+                total_holdings_value += float(stock.price) * holding.quantity
         
         return jsonify({
             'token': token,
@@ -860,8 +843,7 @@ def login():
                 'user_id': user.user_id,
                 'username': user.username,
                 'email': user.email,
-                'balance': float(account.balance) if account else 0.00,
-                'holdings_value': total_holdings_value
+                'balance': total_holdings_value  # Total value of holdings
             }
         }), 200
     return jsonify({'error': 'Invalid credentials'}), 401
@@ -1367,12 +1349,33 @@ def get_stock_by_symbol(symbol):
         "last_updated": "2025-11-22T10:30:00"
     }
     """
+    symbol_upper = symbol.upper()
+    
+    # Try MongoDB first
+    try:
+        mongo_stock = MongoStock.objects(_id=symbol_upper).first()
+        if mongo_stock:
+            return jsonify({
+                'stock_id': mongo_stock.stock_id,
+                'symbol': mongo_stock.symbol,
+                'company': mongo_stock.company,
+                'sector': mongo_stock.sector,
+                'sub_sector': mongo_stock.sub_sector,
+                'country': getattr(mongo_stock, 'country', None),
+                'price': float(mongo_stock.price) if mongo_stock.price else 0.0,
+                'quantity': mongo_stock.quantity if hasattr(mongo_stock, 'quantity') else None,
+                'last_updated': mongo_stock.last_updated.isoformat() if hasattr(mongo_stock, 'last_updated') and mongo_stock.last_updated else None
+            }), 200
+    except Exception as e:
+        print(f"MongoDB query error: {e}")
+    
+    # Fallback to MySQL
     stock = db.session.execute(
-        select(Stock).where(Stock.symbol == symbol.upper())
+        select(Stock).where(Stock.symbol == symbol_upper)
     ).scalar_one_or_none()
     
     if not stock:
-        return jsonify({'error': f'Stock {symbol.upper()} not found'}), 404
+        return jsonify({'error': f'Stock {symbol_upper} not found'}), 404
     
     return jsonify({
         'stock_id': stock.stock_id,
