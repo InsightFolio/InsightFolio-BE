@@ -1599,7 +1599,7 @@ def get_stock_by_symbol(symbol):
 @routes_bp.route('/stocks/all/symbols', methods=['GET'])
 def get_all_stock_symbols():
     """
-    Get all stock symbols and company names from the database.
+    Get all stock symbols and company names from MongoDB.
     
     GET /stocks/all/symbols
     
@@ -1610,14 +1610,17 @@ def get_all_stock_symbols():
         ...
     ]
     """
-    stocks = db.session.execute(
-        select(Stock.symbol, Stock.company).order_by(Stock.symbol)
-    ).all()
-    
-    return jsonify([
-        {'symbol': symbol, 'company': company}
-        for symbol, company in stocks
-    ]), 200
+    try:
+        # Query MongoDB for all stocks, sorted by symbol
+        stocks = MongoStock.objects.only('_id', 'company').order_by('_id')
+        
+        return jsonify([
+            {'symbol': stock.symbol, 'company': stock.company}
+            for stock in stocks
+        ]), 200
+    except Exception as e:
+        print(f"Error fetching stocks from MongoDB: {e}")
+        return jsonify({'error': 'Failed to fetch stocks'}), 500
 
 @routes_bp.route('/yahoo/<symbol>', methods=['GET'])
 def get_yahoo_finance_data(symbol):
